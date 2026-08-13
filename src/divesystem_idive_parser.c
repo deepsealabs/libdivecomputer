@@ -437,6 +437,12 @@ divesystem_idive_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callba
 		firmware = array_uint32_le(data + 0x2E);
 	}
 
+	DEBUG (abstract->context, "Device: firmware=%u.%u.%u/%u",
+		(firmware / 10000000),
+		(firmware / 100000) % 100,
+		(firmware / 1000) % 100,
+		firmware % 1000);
+
 	unsigned int have_location = 0;
 	int altitude = 0, longitude = 0, latitude = 0;
 

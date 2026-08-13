@@ -476,6 +476,12 @@ divesystem_idive_device_foreach (dc_device_t *abstract, dc_dive_callback_t callb
 		}
 	}
 
+	DEBUG (abstract->context, "Device: firmware=%u.%u.%u/%u",
+		(devinfo.firmware / 10000000),
+		(devinfo.firmware / 100000) % 100,
+		(devinfo.firmware / 1000) % 100,
+		devinfo.firmware % 1000);
+
 	unsigned char cmd_range[] = {commands->range.cmd, 0x8D};
 	rc = divesystem_idive_transfer (device, cmd_range, sizeof(cmd_range), packet, commands->range.size, &errcode);
 	if (rc != DC_STATUS_SUCCESS) {
