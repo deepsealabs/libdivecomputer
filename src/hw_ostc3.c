@@ -974,10 +974,10 @@ hw_ostc3_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, voi
 
 		// Verify the header in the logbook and profile are identical.
 		if (memcmp (profile + layout->version, header + offset + logbook->version, 1) != 0 ||
-			compact ?
+			(compact ?
 			memcmp (profile + layout->fingerprint, header + offset + logbook->fingerprint, 10) != 0 ||
 			memcmp (profile + layout->number, header + offset + logbook->number, 2) != 0 :
-			memcmp (profile + layout->fingerprint, header + offset + layout->fingerprint, RB_LOGBOOK_SIZE_FULL - layout->fingerprint) != 0) {
+			memcmp (profile + layout->fingerprint, header + offset + layout->fingerprint, RB_LOGBOOK_SIZE_FULL - layout->fingerprint) != 0)) {
 			ERROR (abstract->context, "Unexpected profile header.");
 			free (profile);
 			free (header);
