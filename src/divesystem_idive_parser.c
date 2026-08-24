@@ -58,8 +58,11 @@
 #define IX3M2_ZHL16C   2
 #define IX3M2_VPM      3
 
-#define REC_SAMPLE 0
 #define REC_INFO   1
+
+#define TANK_VALID        0x8000
+#define TANK_RFCHANNEL    0x001F
+#define TANK_PRESSURE_MSB 0x0020
 
 typedef struct divesystem_idive_parser_t divesystem_idive_parser_t;
 
@@ -437,6 +440,12 @@ divesystem_idive_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callba
 		firmware = array_uint32_le(data + 0x2E);
 	}
 
+	DEBUG (abstract->context, "Device: firmware=%u.%u.%u/%u",
+		(firmware / 10000000),
+		(firmware / 100000) % 100,
+		(firmware / 1000) % 100,
+		firmware % 1000);
+
 	unsigned int have_location = 0;
 	int altitude = 0, longitude = 0, latitude = 0;
 
@@ -447,14 +456,12 @@ divesystem_idive_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callba
 		// Get the record type.
 		unsigned int type = ISIX3M(parser->model) ?
 			array_uint16_le (data + offset + 52) :
-			REC_SAMPLE;
-		if (type != REC_SAMPLE) {
-			if (type == REC_INFO) {
-				altitude  = (signed int) array_uint32_le (data + offset + 40);
-				longitude = (signed int) array_uint32_le (data + offset + 44);
-				latitude  = (signed int) array_uint32_le (data + offset + 48);
-				have_location = 1;
-			}
+			0;
+		if (type == REC_INFO) {
+			altitude  = (signed int) array_uint32_le (data + offset + 40);
+			longitude = (signed int) array_uint32_le (data + offset + 44);
+			latitude  = (signed int) array_uint32_le (data + offset + 48);
+			have_location = 1;
 
 			// Skip non-sample records.
 			offset += samplesize;
@@ -580,6 +587,14 @@ divesystem_idive_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callba
 			unsigned int id = data[offset + 47] & 0x0F;
 			unsigned int flags = data[offset + 47] & 0xF0;
 			unsigned int pressure = data[offset + 49];
+			unsigned int DC_ATTR_UNUSED rfchannel = 0;
+
+			if (type & TANK_VALID) {
+				rfchannel = type & TANK_RFCHANNEL;
+				if (type & TANK_PRESSURE_MSB) {
+					pressure |= 0x100;
+				}
+			}
 
 			if (flags & 0x20) {
 				// 300 bar transmitter.
