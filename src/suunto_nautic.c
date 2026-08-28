@@ -433,11 +433,18 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	// — chunk boundaries are purely a BLE/transport artifact, not
 	// boundaries in the compressed data.
 	//
-	// A ~2400-chunk real single-dive capture (see suunto_nautic.h) shows
-	// the chunk stream ending with one RX opcode 0x09 frame right before
-	// the client moves on to its next request, so we treat that as a
-	// likely end-of-stream marker and stop there. A read timeout is kept
-	// as a fallback in case 0x09 turns out to be something else.
+	// Per the issue's follow-up report, the watch does not need to be
+	// ACKed per chunk: once FETCH2 is sent it blasts the entire stream
+	// continuously, and the host is expected to buffer until a 2.0s
+	// silence timeout. We also still stop early on an RX opcode 0x09
+	// frame (observed ending a ~2400-chunk real capture) as a belt-and-
+	// suspenders check, but the 2.0s timeout is the documented mechanism.
+	status = dc_iostream_set_timeout (device->iostream, 2000);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to set the stream timeout.");
+		return status;
+	}
+
 	dc_buffer_t *compressed = dc_buffer_new (0);
 	if (compressed == NULL)
 		return DC_STATUS_NOMEMORY;

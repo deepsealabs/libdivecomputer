@@ -57,6 +57,7 @@
 
 #define SBEM_MAGIC_SIZE 8
 
+#define CHUNK_GPS             0x0B
 #define CHUNK_PROFILE_1HZ    0x12
 #define CHUNK_EXTENDED_STATUS 0x16
 
@@ -79,6 +80,8 @@ typedef struct suunto_nautic_parser_t {
 	double temperature_maximum;
 	unsigned int ntanks;
 	suunto_nautic_tank_t tank[MAX_TANKS];
+	unsigned int have_location;
+	dc_location_t location;
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -182,6 +185,9 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	suunto_nautic_tank_t tank[MAX_TANKS];
 	memset (tank, 0, sizeof (tank));
 
+	unsigned int have_location = 0;
+	dc_location_t location = {0};
+
 	sbem_chunk_t chunk;
 	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) abstract->size, &offset, &chunk)) {
 		if (chunk.id == CHUNK_PROFILE_1HZ && chunk.size >= 18) {
@@ -251,6 +257,27 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 					}
 				}
 			}
+		} else if (chunk.id == CHUNK_GPS && chunk.size >= 18) {
+			// Latitude/longitude are Int32 LE, degrees * 1e7.
+			int lat_raw = (int) array_uint32_le (chunk.data + 10);
+			int lon_raw = (int) array_uint32_le (chunk.data + 14);
+
+			if (!have_location) {
+				have_location = 1;
+				location.latitude = lat_raw / 1.0e7;
+				location.longitude = lon_raw / 1.0e7;
+				location.altitude = 0.0;
+			}
+
+			if (callback) {
+				dc_sample_value_t sample = {0};
+				sample.time = time * 1000;
+				callback (DC_SAMPLE_TIME, &sample, userdata);
+				sample.location.latitude = lat_raw / 1.0e7;
+				sample.location.longitude = lon_raw / 1.0e7;
+				sample.location.altitude = 0.0;
+				callback (DC_SAMPLE_LOCATION, &sample, userdata);
+			}
 		}
 	}
 
@@ -262,6 +289,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->temperature_maximum = temperature_maximum;
 	parser->ntanks = ntanks;
 	memcpy (parser->tank, tank, sizeof (tank));
+	parser->have_location = have_location;
+	parser->location = location;
 	parser->cached = 1;
 
 	return DC_STATUS_SUCCESS;
@@ -317,6 +346,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		tank->endpressure = parser->tank[flags].endpressure;
 		tank->gasmix = DC_GASMIX_UNKNOWN;
 		tank->usage = DC_USAGE_NONE;
+		break;
+	case DC_FIELD_LOCATION:
+		if (!parser->have_location)
+			return DC_STATUS_UNSUPPORTED;
+		*((dc_location_t *) value) = parser->location;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;

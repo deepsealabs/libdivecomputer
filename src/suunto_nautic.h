@@ -91,28 +91,60 @@
  *     public dc_parser_new2()/dc_parser_get_field()/
  *     dc_parser_samples_foreach() API (max depth 2.6m, temperature
  *     22.9-24.3C, tank pressure 222.8-225.6 bar — all physically
- *     plausible and internally consistent).
+ *     plausible and internally consistent). Chunk 0x0B (GPS lat/long,
+ *     per the issue's documented offsets) is also implemented, but
+ *     that reference dive doesn't contain a 0x0B chunk, so it's coded
+ *     to spec rather than independently verified against real bytes.
+ *
+ * A later issue update confirmed several things independently derived
+ * above, and clarified two more:
+ *   - The endpoint really is ".../Data", not ".../Data4K" as an even
+ *     earlier version of the issue guessed — the ASCII-looking "4K"
+ *     was actually the first two CRC32 bytes of a "Data"-ending path,
+ *     misread as trailing characters of the path string itself.
+ *   - The "Stream Fetch" trigger frames' sequence number is described
+ *     as "the watch's ACK contains a Watch Magic Session ID; increment
+ *     it by 1 for FETCH1, by 2 for FETCH2". This driver already does
+ *     the equivalent: suunto_nautic_device_download() uses one shared
+ *     monotonic per-connection counter for every request it sends, so
+ *     FETCH1/FETCH2 naturally get GET-request-seq+1 and +2. Checked
+ *     against the real captured session: GET .../Data used seq 881,
+ *     FETCH1 used 882, FETCH2 used 883 — matches exactly. The rest of
+ *     the FETCH frame (the "tail" bytes beyond the sequence number) is
+ *     still replayed verbatim from that one capture, since neither
+ *     report explains it and it isn't yet known whether those bytes
+ *     are per-session or fixed protocol constants.
+ *   - The chunk stream after FETCH2 is unacknowledged and continuous;
+ *     the host is expected to buffer until a 2.0s silence timeout,
+ *     which is what suunto_nautic_device_download() now does (an
+ *     earlier version used a longer, less precise timeout and leaned
+ *     on an observed-but-unexplained RX opcode 0x09 frame as the
+ *     primary stop condition; that check is now a secondary one).
  *
  * What is NOT understood/implemented:
  *   - The "EVA" authentication handshake is replayed verbatim from a
  *     single captured session; whether it is universal or session/
  *     device-specific is unknown.
- *   - The "Stream Fetch" trigger frames that make the watch start
- *     sending file data are only partly explained: the sequence number
- *     generalizes cleanly (see suunto_nautic.c), but the rest of the
- *     frame appears to echo device/session state we cannot yet derive,
- *     so they are also replayed verbatim as a best-effort probe.
+ *   - The non-sequence-number portion of the "Stream Fetch" trigger
+ *     frames (see above) is still a verbatim replay, not derived.
  *   - The response format of /Logbook/Entries and
  *     /Logbook/UnsynchronisedLogs (needed to enumerate real dive IDs)
  *     has no known sample and is not parsed.
- *   - Most SBEM chunk IDs beyond 0x12/0x16. The issue's chunk
- *     dictionary also names 0x08 (activity), 0x0B (GPS), 0x0E
- *     (satellites), 0x14 (battery), 0x17 (surface pressure) with exact
- *     byte offsets, and 0x1A/0x1B/0x1C/0x1E (dive events: laps, alarms,
- *     gas switches, notifications) and 0x23/0x24 (high-frequency IMU)
- *     more qualitatively, without exact offsets. None of these are
- *     wired into the parser yet; unknown chunk IDs are silently
- *     skipped (not treated as errors), so adding them is additive.
+ *   - Most SBEM chunk IDs beyond 0x12/0x16/0x0B. The issue's chunk
+ *     dictionary also names 0x08 (activity), 0x0E (satellites), 0x14
+ *     (battery), 0x17 (surface pressure) with exact byte offsets, and
+ *     0x1A/0x1B/0x1C/0x1E (dive events: laps, alarms, gas switches,
+ *     notifications) and 0x23/0x24 (high-frequency IMU) more
+ *     qualitatively, without exact offsets. None of these are wired
+ *     into the parser yet; unknown chunk IDs are silently skipped (not
+ *     treated as errors), so adding them is additive. The event chunks
+ *     in particular need a real known-plaintext capture (raw SBEM +
+ *     the official Suunto app's JSON export of the *same* dive,
+ *     ideally one with an alarm/gas-switch/lap event in it) to map —
+ *     static analysis of the official Android app's decoder
+ *     (`libmds.so`) was attempted and confirmed the chunk-ID→field
+ *     mapping is real but compiled into scattered runtime-populated
+ *     lookups, not extractable without full manual decompilation.
  *   - No chunk in the decoded stream carries a wall-clock timestamp.
  *     Per the issue, that likely lives in the separate /Summary
  *     endpoint (not yet explored/requested by this driver). Sample
