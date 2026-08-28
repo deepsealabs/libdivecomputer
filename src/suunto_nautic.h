@@ -22,10 +22,11 @@
 /*
  * EXPERIMENTAL Suunto Nautic / Ocean ("Vaasa" generation) support.
  *
- * Reverse-engineering reference: libdivecomputer issue #70. As of this
- * writing that investigation is still open and unresolved upstream.
- * Sources used to write this driver: the hex frame samples posted in
- * the issue body/comments, a ~9.8KB single-dive raw capture attached
+ * Reverse-engineering reference: libdivecomputer issue #70. Sources used
+ * to write this driver: the hex frame samples and two written reports
+ * posted in the issue (an initial report, and a follow-up "Extended
+ * Status, Cylinders and GPS" / "Full Chunk Dictionary" update that
+ * solved the compression), a ~9.8KB single-dive raw capture attached
  * there (dive_1787752091.zip, fully intact — not a text export), and a
  * full ~15,000-line Apple PacketLogger session export also attached
  * there (iphone.txt) covering one real sync that downloaded one dive in
@@ -57,6 +58,40 @@
  *     request. Two more opcodes (0x0D before the GET, 0x11 near the end
  *     of the chunk stream) appear in every real session but are not
  *     understood; they are not sent by this driver.
+ *   - The MDS chunk header wrapping each compressed block (opcode 0x01
+ *     frames): 28 bytes, with the true payload size as a little-endian
+ *     u16 at offset 20-21 and the payload itself starting at offset 28.
+ *     An earlier version of this file used a 20-byte header based on a
+ *     small (31-chunk) isolated capture where the 4 bytes at offset 16
+ *     happened to look like a linearly incrementing byte offset (0,
+ *     278, 556, ...); that was refuted by a full ~2425-chunk real
+ *     capture, where the same bytes are statistically indistinguishable
+ *     from random. They are simply the start of the compressed payload
+ *     under the wrong header size, not reassembly metadata — reading
+ *     from offset 20 instead of 28 injects 8 bytes of garbage into the
+ *     decompressor's LZSS window and corrupts everything after the
+ *     first block.
+ *   - The compression: Heatshrink (an LZSS variant; see
+ *     src/heatshrink/), window_sz2=7, lookahead_sz2=5. NOT LZ4 as an
+ *     earlier version of this file assumed based on the issue's initial
+ *     "headerless LZ4 block" description — that description turned out
+ *     to be a naming/guess error on the issue author's part, corrected
+ *     in their own follow-up. Verified byte-for-byte against a
+ *     reference Python implementation (heatshrink2) using the real
+ *     dive_1787752091.zip capture; the decompressed output starts with
+ *     the expected "SBEM0103" magic.
+ *   - The decompressed container format: SBEM0103, a numeric
+ *     Type-Length-Value stream — [id: 1 byte][length: 1 byte][value:
+ *     length bytes], where length==255 means an extended 4-byte
+ *     little-endian length follows before the value. Implemented in
+ *     suunto_nautic_parser.c, which currently decodes chunk 0x12 (1Hz
+ *     AbsPressure/Temperature) and chunk 0x16 (Depth, cylinder/tank
+ *     pressures, NDL, time-to-surface) into real dc_field/dc_sample
+ *     output — verified end-to-end against dive_1787752091.zip via the
+ *     public dc_parser_new2()/dc_parser_get_field()/
+ *     dc_parser_samples_foreach() API (max depth 2.6m, temperature
+ *     22.9-24.3C, tank pressure 222.8-225.6 bar — all physically
+ *     plausible and internally consistent).
  *
  * What is NOT understood/implemented:
  *   - The "EVA" authentication handshake is replayed verbatim from a
@@ -70,45 +105,37 @@
  *   - The response format of /Logbook/Entries and
  *     /Logbook/UnsynchronisedLogs (needed to enumerate real dive IDs)
  *     has no known sample and is not parsed.
- *   - The "PMT" chunk header/payload split. A small (31-chunk) isolated
- *     capture made the 4 bytes at header offset 16 look like a linearly
- *     incrementing byte offset (0, 278, 556, ...), which is what an
- *     earlier version of this file assumed. The full ~2425-chunk real
- *     capture refutes that: those same 4 bytes are statistically
- *     indistinguishable from random across the full stream (~50% of
- *     consecutive deltas are negative), meaning they are almost
- *     certainly just the start of the compressed payload, not
- *     reassembly metadata, and the earlier reading was a coincidence of
- *     a very small sample. The real header/payload boundary and any
- *     real reassembly mechanism remain unknown. Chunks are therefore
- *     captured and concatenated RAW (framing intact) rather than
- *     reassembled into one buffer.
- *   - The dive-data compression itself ("headerless LZ4 block" per the
- *     issue). Standard raw LZ4 block decompression was tested against a
- *     real captured chunk payload and does not decode it, so it is a
- *     distinct/unknown algorithm. suunto_nautic_parser_create() does
- *     not attempt decompression; it exposes only raw/vendor data.
+ *   - Most SBEM chunk IDs beyond 0x12/0x16. The issue's chunk
+ *     dictionary also names 0x08 (activity), 0x0B (GPS), 0x0E
+ *     (satellites), 0x14 (battery), 0x17 (surface pressure) with exact
+ *     byte offsets, and 0x1A/0x1B/0x1C/0x1E (dive events: laps, alarms,
+ *     gas switches, notifications) and 0x23/0x24 (high-frequency IMU)
+ *     more qualitatively, without exact offsets. None of these are
+ *     wired into the parser yet; unknown chunk IDs are silently
+ *     skipped (not treated as errors), so adding them is additive.
+ *   - No chunk in the decoded stream carries a wall-clock timestamp.
+ *     Per the issue, that likely lives in the separate /Summary
+ *     endpoint (not yet explored/requested by this driver). Sample
+ *     time is therefore a synthetic per-chunk-0x12 counter (see
+ *     suunto_nautic_parser.c), and dc_parser_get_datetime() is
+ *     unsupported.
  *
  * A third issue attachment (a ~1MB Suunto app JSON export,
- * 6a8f0979bfa3f0177c29721f.json) is NOT a byte-exact plaintext pair for
- * either raw capture above (it has no "1787752091" logbook ID anywhere,
- * and is dated a day before the iphone.txt session), so it can't be used
- * for a known-plaintext attack on the compression. It IS useful as the
- * confirmed TARGET decoded schema once compression is solved: a
- * DeviceLog.Header (dive/session summary: DiveTime, Depth.Max, Ascent/
- * Descent rate, Temperature, HrZones, Device.Info.{HW,SW} = "GT_RevX"/
- * firmware version, ...) plus DeviceLog.Samples, a flat time-ordered
- * array where each entry carries whichever fields changed at that
- * instant (sparse encoding) — Depth/Cylinders(tank pressure, 8
- * slots)/DeviceInternalTemperature/RtGradientFactors/NoDecTime/
- * TimeToSurface at ~8s intervals during the dive, and Altitude/Cadence/
- * Power/Speed/Temperature/AbsPressure at ~1Hz for the whole activity.
+ * 6a8f0979bfa3f0177c29721f.json) is a different dive than either raw
+ * capture above (no shared logbook ID, different date), so it wasn't a
+ * usable known-plaintext pair — but its DeviceLog.Header/.Samples
+ * schema (Depth, Cylinders tank pressure, DeviceInternalTemperature,
+ * NoDecTime, TimeToSurface, ...) matches the now-decoded SBEM chunk
+ * 0x16 fields closely enough to have served as a second, independent
+ * confirmation that the decode is producing the right kind of data.
  *
  * Practical implication: this driver can connect, authenticate
- * (best-effort), and download the raw bytes of a *known* logbook entry
- * ID via suunto_nautic_device_download(). It cannot yet enumerate which
- * IDs exist on a given watch, and it cannot decode a downloaded entry
- * into an actual dive profile.
+ * (best-effort), download, and decode a *known* logbook entry ID via
+ * suunto_nautic_device_download() + suunto_nautic_parser_create() into
+ * a real depth/temperature/tank-pressure profile. It cannot yet
+ * enumerate which IDs exist on a given watch, cannot get the true dive
+ * date/time, and does not yet decode dive events, GPS, or the other
+ * chunk IDs named above.
  */
 
 #ifndef SUUNTO_NAUTIC_H

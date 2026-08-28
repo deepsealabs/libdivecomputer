@@ -30,6 +30,7 @@
 #include "checksum.h"
 #include "array.h"
 #include "hdlc.h"
+#include "heatshrink/heatshrink_decoder.h"
 
 // See suunto_nautic.h for the full picture of what is/isn't understood.
 
@@ -48,6 +49,23 @@
 // watch signals "no more chunks") is unknown, so we stop on the first read
 // timeout instead.
 #define MAX_CHUNKS 4096
+
+// The Suunto "MDS" chunk header wrapping each compressed block. Verified
+// against a real capture (see suunto_nautic.h): the header is 28 bytes,
+// NOT 20 as an earlier version of this file assumed — the 8 bytes at
+// offset 20-27 are MDS metadata (including the true payload size at
+// offset 20-21), not part of the compressed payload. Reading from offset
+// 20 instead of 28 injects 8 bytes of garbage into the decompressor's
+// LZSS window and corrupts everything after the first block.
+#define MDS_HEADER_SIZE     28
+#define MDS_CHUNK_SIZE_OFFSET 20
+
+// Heatshrink (LZSS) parameters used by the Nautic/Ocean's MDS stream.
+#define HEATSHRINK_WINDOW_SZ2    7
+#define HEATSHRINK_LOOKAHEAD_SZ2 5
+#define HEATSHRINK_INPUT_BUFFER_SIZE 256
+
+static const unsigned char SBEM_MAGIC[8] = {'S','B','E','M','0','1','0','3'};
 
 typedef struct suunto_nautic_device_t {
 	dc_device_t base;
@@ -283,6 +301,76 @@ suunto_nautic_device_request (dc_device_t *abstract, const char *path, dc_buffer
 	return suunto_nautic_transfer (device, packet, len, response);
 }
 
+// Decompress a Heatshrink (LZSS) stream, per the parameters documented
+// above. Verified byte-for-byte against a reference implementation using
+// real captured data (see suunto_nautic.h).
+static dc_status_t
+suunto_nautic_heatshrink_decompress (dc_context_t *context, const unsigned char *input, size_t input_size, dc_buffer_t *output)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	unsigned char outbuf[HEATSHRINK_INPUT_BUFFER_SIZE];
+
+	heatshrink_decoder *hsd = heatshrink_decoder_alloc (HEATSHRINK_INPUT_BUFFER_SIZE, HEATSHRINK_WINDOW_SZ2, HEATSHRINK_LOOKAHEAD_SZ2);
+	if (hsd == NULL) {
+		ERROR (context, "Failed to allocate the heatshrink decoder.");
+		return DC_STATUS_NOMEMORY;
+	}
+
+	dc_buffer_clear (output);
+
+	size_t sunk_total = 0;
+	while (sunk_total < input_size) {
+		size_t sunk = 0;
+		HSD_sink_res sres = heatshrink_decoder_sink (hsd, (uint8_t *) input + sunk_total, input_size - sunk_total, &sunk);
+		if (sres < 0) {
+			ERROR (context, "Heatshrink sink error (%d).", sres);
+			status = DC_STATUS_DATAFORMAT;
+			goto done;
+		}
+		sunk_total += sunk;
+
+		HSD_poll_res pres;
+		do {
+			size_t polled = 0;
+			pres = heatshrink_decoder_poll (hsd, outbuf, sizeof (outbuf), &polled);
+			if (pres < 0) {
+				ERROR (context, "Heatshrink poll error (%d).", pres);
+				status = DC_STATUS_DATAFORMAT;
+				goto done;
+			}
+			if (polled && !dc_buffer_append (output, outbuf, polled)) {
+				ERROR (context, "Failed to allocate memory.");
+				status = DC_STATUS_NOMEMORY;
+				goto done;
+			}
+		} while (pres == HSDR_POLL_MORE);
+	}
+
+	HSD_finish_res fres = heatshrink_decoder_finish (hsd);
+	while (fres == HSDR_FINISH_MORE) {
+		HSD_poll_res pres;
+		do {
+			size_t polled = 0;
+			pres = heatshrink_decoder_poll (hsd, outbuf, sizeof (outbuf), &polled);
+			if (pres < 0) {
+				ERROR (context, "Heatshrink poll error (%d).", pres);
+				status = DC_STATUS_DATAFORMAT;
+				goto done;
+			}
+			if (polled && !dc_buffer_append (output, outbuf, polled)) {
+				ERROR (context, "Failed to allocate memory.");
+				status = DC_STATUS_NOMEMORY;
+				goto done;
+			}
+		} while (pres == HSDR_POLL_MORE);
+		fres = heatshrink_decoder_finish (hsd);
+	}
+
+done:
+	heatshrink_decoder_free (hsd);
+	return status;
+}
+
 dc_status_t
 suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *raw)
 {
@@ -337,18 +425,22 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 		return status;
 	}
 
-	// 3. Capture whatever chunk frames arrive. Reassembly semantics for
-	// the PMT chunk headers are not understood (see suunto_nautic.h), so
-	// chunks are appended RAW (HDLC-deframed, but with their own headers
-	// and per-chunk CRC intact) rather than stitched into one buffer.
+	// 3. Capture the MDS chunk frames (opcode 0x01) and pull out each
+	// one's true compressed sub-payload: the MDS header is 28 bytes, and
+	// the payload size is a little-endian u16 at offset 20-21 (see the
+	// MDS_HEADER_SIZE comment above). The concatenation of these
+	// sub-payloads across all chunks is one continuous Heatshrink stream
+	// — chunk boundaries are purely a BLE/transport artifact, not
+	// boundaries in the compressed data.
 	//
 	// A ~2400-chunk real single-dive capture (see suunto_nautic.h) shows
-	// the chunk stream (opcode 0x01) ending with one RX opcode 0x09
-	// frame right before the client moves on to its next request, so we
-	// treat that as a likely end-of-stream marker and stop there. A read
-	// timeout is kept as a fallback in case 0x09 turns out to be
-	// something else (only one real capture has been analyzed so far).
-	dc_buffer_clear (raw);
+	// the chunk stream ending with one RX opcode 0x09 frame right before
+	// the client moves on to its next request, so we treat that as a
+	// likely end-of-stream marker and stop there. A read timeout is kept
+	// as a fallback in case 0x09 turns out to be something else.
+	dc_buffer_t *compressed = dc_buffer_new (0);
+	if (compressed == NULL)
+		return DC_STATUS_NOMEMORY;
 
 	for (unsigned int i = 0; i < MAX_CHUNKS; i++) {
 		unsigned char packet[MAX_PACKET] = {0};
@@ -358,22 +450,55 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 			if (status == DC_STATUS_TIMEOUT)
 				break;
 			ERROR (abstract->context, "Failed to receive a stream chunk.");
+			dc_buffer_free (compressed);
 			return status;
 		}
 
 		if (len == 0)
 			break;
 
-		if (!dc_buffer_append (raw, packet, len)) {
-			ERROR (abstract->context, "Failed to allocate memory.");
-			return DC_STATUS_NOMEMORY;
-		}
-
 		if (len >= 2 && packet[0] == 0xA5 && packet[1] == 0x09)
 			break;
+
+		if (len >= 2 && packet[0] == 0xA5 && packet[1] == 0x01) {
+			if (len < MDS_HEADER_SIZE) {
+				WARNING (abstract->context, "MDS chunk shorter than the header (" DC_PRINTF_SIZE ").", len);
+				continue;
+			}
+
+			unsigned int chunk_size = array_uint16_le (packet + MDS_CHUNK_SIZE_OFFSET);
+			if (MDS_HEADER_SIZE + chunk_size > len) {
+				WARNING (abstract->context, "MDS chunk size (%u) exceeds the frame (" DC_PRINTF_SIZE ").", chunk_size, len);
+				continue;
+			}
+
+			if (!dc_buffer_append (compressed, packet + MDS_HEADER_SIZE, chunk_size)) {
+				ERROR (abstract->context, "Failed to allocate memory.");
+				dc_buffer_free (compressed);
+				return DC_STATUS_NOMEMORY;
+			}
+		}
 	}
 
-	DEBUG (abstract->context, "Captured " DC_PRINTF_SIZE " raw bytes for logbook entry %s.",
+	DEBUG (abstract->context, "Captured " DC_PRINTF_SIZE " compressed bytes for logbook entry %s.",
+		dc_buffer_get_size (compressed), logbook_id);
+
+	// 4. Decompress and verify the SBEM0103 magic.
+	status = suunto_nautic_heatshrink_decompress (abstract->context,
+		dc_buffer_get_data (compressed), dc_buffer_get_size (compressed), raw);
+	dc_buffer_free (compressed);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to decompress the logbook entry.");
+		return status;
+	}
+
+	if (dc_buffer_get_size (raw) < sizeof (SBEM_MAGIC) ||
+		memcmp (dc_buffer_get_data (raw), SBEM_MAGIC, sizeof (SBEM_MAGIC)) != 0) {
+		ERROR (abstract->context, "Unexpected magic in the decompressed data.");
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	DEBUG (abstract->context, "Decompressed " DC_PRINTF_SIZE " bytes for logbook entry %s.",
 		dc_buffer_get_size (raw), logbook_id);
 
 	return DC_STATUS_SUCCESS;

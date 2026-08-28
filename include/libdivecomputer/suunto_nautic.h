@@ -29,12 +29,12 @@
  * dc_device_open() / dc_device_foreach() / dc_parser_new2() interface,
  * with no family-specific public API. This family is a deliberate
  * exception: dc_device_foreach() cannot yet enumerate real dives (the
- * /Logbook/Entries response format is unknown) and dc_parser_t cannot
- * yet decode one (the SML/LZ4-like compression is unknown), so these
- * two functions exist to let client applications still get useful
- * work done — exploring the RPC protocol and downloading raw,
- * undecoded dive data by a known logbook ID — while that reverse-
- * engineering is ongoing.
+ * /Logbook/Entries response format is still unknown), so these two
+ * functions exist to let client applications still get useful work
+ * done — exploring the RPC protocol, and downloading + decompressing a
+ * dive by a known logbook ID into its decoded SBEM0103 form, ready for
+ * suunto_nautic_parser_create() — while that enumeration piece is still
+ * being reverse-engineered.
  */
 
 #ifndef DC_SUUNTO_NAUTIC_H
@@ -59,9 +59,10 @@ dc_status_t
 suunto_nautic_device_request (dc_device_t *device, const char *path, dc_buffer_t *response);
 
 /*
- * Download the raw (still compressed, undecoded) bytes for a specific
- * logbook entry, given its numeric id as it appears in a
- * "/Logbook/byId/<id>/..." path (e.g. "1787752091").
+ * Download and decompress a specific logbook entry, given its numeric
+ * id as it appears in a "/Logbook/byId/<id>/..." path (e.g.
+ * "1787752091"). On success, `raw` holds the decoded SBEM0103 TLV
+ * stream (magic-verified), suitable for suunto_nautic_parser_create().
  */
 dc_status_t
 suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_buffer_t *raw);
