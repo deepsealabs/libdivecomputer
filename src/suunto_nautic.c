@@ -126,13 +126,14 @@ static const unsigned char suunto_nautic_eva_handshake[] = {
 };
 
 /*
- * Also captured verbatim. The sequence-number field (bytes 4-5) is known
- * to be "the previous request's sequence + 1" (see
- * suunto_nautic_build_stream_fetch below), but the remaining fields do not
- * match a pattern we can derive from the single available sample, so the
- * rest of the frame is replayed literally. This is a best-effort probe,
- * not a verified mechanism — expect it to need correction once real
- * captures from other sessions/devices are available.
+ * Also captured verbatim. The sequence-number field (bytes 4-5) is the
+ * watch's own "Watch Magic" for this transfer plus 1 (FETCH1) or plus 2
+ * (FETCH2), read from the ACK response to the preceding GET request --
+ * see suunto_nautic_device_download(). The remaining fields do not
+ * match a pattern we can derive from the single available sample, so
+ * the rest of the frame is replayed literally. This is a best-effort
+ * probe, not a verified mechanism — expect it to need correction once
+ * real captures from other sessions/devices are available.
  */
 static const unsigned char suunto_nautic_fetch1_tail[] = {
 	0x00, 0x24, 0x12, 0x01, 0x80, 0x00
@@ -409,27 +410,43 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	if (n < 0 || (size_t) n >= sizeof (path))
 		return DC_STATUS_INVALIDARGS;
 
-	// 1. Request the file. The watch acknowledges but does not send data yet.
+	// 1. Request the file. The watch acknowledges with its own "Watch
+	// Magic": a session id it generates specifically to authorize this
+	// transfer, returned as a little-endian UInt32 at offset 5 in the
+	// ACK response. The stream-fetch triggers below need Watch_Magic+1
+	// and +2, not our own request sequence -- confirmed independently on
+	// issue #29. Previously this used device->sequence for both, which
+	// only worked because it happened to match the watch's magic in the
+	// one captured session this was originally derived from.
 	dc_buffer_t *ack = dc_buffer_new (0);
 	if (ack == NULL)
 		return DC_STATUS_NOMEMORY;
 
 	status = suunto_nautic_device_request (abstract, path, ack);
-	dc_buffer_free (ack);
 	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (ack);
 		ERROR (abstract->context, "Failed to request the logbook entry.");
 		return status;
 	}
 
-	// 2. Trigger the stream (best-effort; see suunto_nautic_fetch*_tail).
+	const unsigned char *ack_data = dc_buffer_get_data (ack);
+	size_t ack_size = dc_buffer_get_size (ack);
+	if (ack_size < 9) {
+		dc_buffer_free (ack);
+		ERROR (abstract->context, "ACK response too short to contain the watch magic (" DC_PRINTF_SIZE ").", ack_size);
+		return DC_STATUS_DATAFORMAT;
+	}
+	unsigned int watch_magic = array_uint32_le (ack_data + 5);
+	dc_buffer_free (ack);
+
+	// 2. Trigger the stream using Watch_Magic+1/+2.
 	unsigned char fetch[32];
 	unsigned int fetch_len = 0;
 
-	status = suunto_nautic_build_stream_fetch (fetch, sizeof (fetch), &fetch_len, device->sequence,
+	status = suunto_nautic_build_stream_fetch (fetch, sizeof (fetch), &fetch_len, watch_magic + 1,
 		RPC_OP_STREAM_FETCH1, suunto_nautic_fetch1_tail, sizeof (suunto_nautic_fetch1_tail));
 	if (status != DC_STATUS_SUCCESS)
 		return status;
-	device->sequence++;
 
 	status = dc_iostream_write (device->iostream, fetch, fetch_len, NULL);
 	if (status != DC_STATUS_SUCCESS) {
@@ -437,11 +454,10 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 		return status;
 	}
 
-	status = suunto_nautic_build_stream_fetch (fetch, sizeof (fetch), &fetch_len, device->sequence,
+	status = suunto_nautic_build_stream_fetch (fetch, sizeof (fetch), &fetch_len, watch_magic + 2,
 		RPC_OP_STREAM_FETCH2, suunto_nautic_fetch2_tail, sizeof (suunto_nautic_fetch2_tail));
 	if (status != DC_STATUS_SUCCESS)
 		return status;
-	device->sequence++;
 
 	status = dc_iostream_write (device->iostream, fetch, fetch_len, NULL);
 	if (status != DC_STATUS_SUCCESS) {
