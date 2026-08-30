@@ -37,13 +37,29 @@
  * output — unknown chunk IDs are simply skipped, not treated as
  * errors, so extending this later is additive.
  *
- * No chunk in this stream carries a wall-clock timestamp; per the
- * issue, that likely lives in the separate /Summary endpoint (not yet
- * explored). dc_parser_get_datetime() is therefore unsupported. Sample
- * time is a synthetic counter incremented once per chunk 0x12 record,
- * since that chunk is described as a 1Hz profile — the 2-byte field at
- * its offset 0 looks like a sub-second phase (values cluster on
- * multiples of 10, wrapping 0-90) rather than a usable elapsed-time
+ * No chunk in this stream carries a wall-clock timestamp. Per a later
+ * report on the issue, the dive start time is NOT inside the SBEM
+ * payload at all -- it IS the dive ID returned by /Logbook/Entries
+ * (an array of 4-byte little-endian UInt32, each one a standard UNIX
+ * timestamp, used as the logbook_id argument to
+ * suunto_nautic_device_download()). Since that value is already known
+ * to the caller before download() is ever invoked, wiring it into
+ * dc_parser_get_datetime() would require either threading it through
+ * suunto_nautic_parser_create() as an extra argument or having the
+ * caller set it separately -- an API decision, not made here.
+ * dc_parser_get_datetime() is therefore still unsupported for now.
+ *
+ * Similarly, device metadata (serial number, hardware/software
+ * version) is not in this payload either -- it's retrieved out-of-band
+ * during the BLE connection handshake (serial from the advertisement
+ * packet or /System/Info; HW/SW version via /System/Mode or
+ * /Dev/Capabilities), before the logbook is ever queried. Not this
+ * parser's concern, noted here only so it isn't hunted for again.
+ *
+ * Sample time is a synthetic counter incremented once per chunk 0x12
+ * record, since that chunk is described as a 1Hz profile — the 2-byte
+ * field at its offset 0 looks like a sub-second phase (values cluster
+ * on multiples of 10, wrapping 0-90) rather than a usable elapsed-time
  * counter, so it is intentionally not used for timing.
  */
 
@@ -126,38 +142,68 @@ suunto_nautic_parser_create (dc_parser_t **out, dc_context_t *context, const uns
 	return DC_STATUS_SUCCESS;
 }
 
+// Chunk IDs whose payload length is fixed and has been confirmed
+// against real captured data. Heatshrink decompression can leave
+// localized artifacts in the stream (e.g. runs of a single repeated
+// byte), which a strict linear TLV walk would otherwise misread as a
+// chunk header -- permanently desyncing every chunk after it. Any
+// candidate header naming one of these IDs is only accepted if its
+// length byte matches; otherwise it is a "ghost chunk" and the parser
+// resynchronizes by scanning forward one byte at a time.
+static int
+suunto_nautic_sbem_fixed_length (unsigned int id)
+{
+	switch (id) {
+	case CHUNK_GPS:             return 20;
+	case CHUNK_EXTENDED_STATUS: return 195;
+	default:                    return -1; // unknown or variable length
+	}
+}
+
 // Advance to the next TLV chunk starting at *offset. Returns 0 (and
-// leaves *offset unchanged) once the buffer is exhausted or malformed.
+// leaves *offset unchanged) once the buffer is exhausted.
 static int
 suunto_nautic_sbem_next (const unsigned char data[], unsigned int size, unsigned int *offset, sbem_chunk_t *chunk)
 {
 	unsigned int pos = *offset;
-	unsigned int header = 2;
-	unsigned int length = 0;
 
-	if (pos + 2 > size)
-		return 0;
+	while (pos + 2 <= size) {
+		unsigned int id = data[pos];
+		unsigned int length = data[pos + 1];
+		unsigned int header = 2;
 
-	unsigned int id = data[pos];
-	length = data[pos + 1];
+		if (length == 255) {
+			if (pos + 6 > size) {
+				pos++;
+				continue;
+			}
+			length = array_uint32_le (data + pos + 2);
+			header = 6;
+		}
 
-	if (length == 255) {
-		if (pos + 6 > size)
-			return 0;
-		length = array_uint32_le (data + pos + 2);
-		header = 6;
+		int fixed = suunto_nautic_sbem_fixed_length (id);
+		if (fixed >= 0 && (unsigned int) fixed != length) {
+			// Ghost chunk: a real chunk with this id never has
+			// this length. Resynchronize.
+			pos++;
+			continue;
+		}
+
+		if (pos + header + length > size) {
+			pos++;
+			continue;
+		}
+
+		chunk->id = id;
+		chunk->data = data + pos + header;
+		chunk->size = length;
+
+		*offset = pos + header + length;
+
+		return 1;
 	}
 
-	if (pos + header + length > size)
-		return 0;
-
-	chunk->id = id;
-	chunk->data = data + pos + header;
-	chunk->size = length;
-
-	*offset = pos + header + length;
-
-	return 1;
+	return 0;
 }
 
 static dc_status_t
