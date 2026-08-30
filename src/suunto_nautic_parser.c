@@ -29,13 +29,15 @@
  *   length == 255 means an extended 4-byte little-endian length follows
  *   immediately, before the value.
  *
- * Only the chunks confirmed against real captured data are decoded
- * here (0x12 and 0x16). Several other chunk IDs are documented in the
- * issue (0x08 activity, 0x0B GPS, 0x0E satellites, 0x14 battery, 0x17
- * surface pressure, 0x1A/0x1B/0x1C/0x1E dive events, 0x23/0x24
- * high-frequency IMU) but are not yet wired into dc_field/dc_sample
- * output — unknown chunk IDs are simply skipped, not treated as
- * errors, so extending this later is additive.
+ * Chunks 0x12 and 0x16 are decoded against real captured data; 0x0B
+ * (GPS) is decoded to spec but the reference dive used for
+ * verification doesn't contain one, so it's unconfirmed against real
+ * bytes. Several other chunk IDs are documented in the issue (0x08
+ * activity, 0x0E satellites, 0x14 battery, 0x17 surface pressure,
+ * 0x1A/0x1B/0x1C/0x1E dive events, 0x23/0x24 high-frequency IMU) but
+ * are not yet wired into dc_field/dc_sample output — unknown chunk IDs
+ * are simply skipped, not treated as errors, so extending this later
+ * is additive.
  *
  * No chunk in this stream carries a wall-clock timestamp. Per a later
  * report on the issue, the dive start time is NOT inside the SBEM

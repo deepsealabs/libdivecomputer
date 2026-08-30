@@ -145,12 +145,25 @@
  *     (`libmds.so`) was attempted and confirmed the chunk-ID→field
  *     mapping is real but compiled into scattered runtime-populated
  *     lookups, not extractable without full manual decompilation.
- *   - No chunk in the decoded stream carries a wall-clock timestamp.
- *     Per the issue, that likely lives in the separate /Summary
- *     endpoint (not yet explored/requested by this driver). Sample
- *     time is therefore a synthetic per-chunk-0x12 counter (see
- *     suunto_nautic_parser.c), and dc_parser_get_datetime() is
- *     unsupported.
+ *   - No chunk in the decoded stream carries a wall-clock timestamp --
+ *     but a later report clarified it doesn't need to: the dive start
+ *     time IS the dive ID itself. /Logbook/Entries (still unparsed,
+ *     see above) returns an array of 4-byte little-endian UInt32,
+ *     each one a standard UNIX timestamp, used as-is for the
+ *     logbook_id argument to suunto_nautic_device_download() -- so the
+ *     caller already has this value before download() is ever called.
+ *     Wiring it into dc_parser_get_datetime() needs an API decision
+ *     (thread it through suunto_nautic_parser_create() as an extra
+ *     argument, or have the caller set it separately) that hasn't been
+ *     made; dc_parser_get_datetime() is therefore still unsupported,
+ *     and sample time remains a synthetic per-chunk-0x12 counter (see
+ *     suunto_nautic_parser.c).
+ *   - Device metadata (serial number, hardware/software version) isn't
+ *     in this payload either -- it's retrieved out-of-band during the
+ *     BLE connection handshake (serial from the advertisement packet
+ *     or /System/Info; HW/SW version via /System/Mode or
+ *     /Dev/Capabilities), before the logbook is ever queried. Not this
+ *     driver's concern, noted here only so it isn't hunted for again.
  *
  * A third issue attachment (a ~1MB Suunto app JSON export,
  * 6a8f0979bfa3f0177c29721f.json) is a different dive than either raw
@@ -165,9 +178,20 @@
  * (best-effort), download, and decode a *known* logbook entry ID via
  * suunto_nautic_device_download() + suunto_nautic_parser_create() into
  * a real depth/temperature/tank-pressure profile. It cannot yet
- * enumerate which IDs exist on a given watch, cannot get the true dive
- * date/time, and does not yet decode dive events, GPS, or the other
- * chunk IDs named above.
+ * enumerate which IDs exist on a given watch (though, per above, the
+ * caller already has the dive's timestamp the moment it has that ID),
+ * and does not yet decode dive events or the other chunk IDs named
+ * above.
+ *
+ * Robustness note: Heatshrink decompression can leave localized
+ * artifacts in the decoded stream (observed as runs of a single
+ * repeated byte), which a naive linear TLV walk would misread as a
+ * chunk header and permanently desync every chunk after it.
+ * suunto_nautic_sbem_next() (suunto_nautic_parser.c) guards against
+ * this for the two chunk IDs with a confirmed fixed length (0x0B = 20
+ * bytes, 0x16 = 195 bytes): a length mismatch means the candidate
+ * header is an artifact, and the parser resynchronizes by scanning
+ * forward one byte at a time instead of trusting it.
  */
 
 #ifndef SUUNTO_NAUTIC_H
