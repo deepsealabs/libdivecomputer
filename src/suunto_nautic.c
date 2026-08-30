@@ -71,15 +71,22 @@ typedef struct suunto_nautic_device_t {
 	dc_device_t base;
 	dc_iostream_t *iostream; // HDLC-framed
 	unsigned int sequence;
+	// The dive ID (a UNIX timestamp, see suunto_nautic_device_foreach) of
+	// the most recently downloaded dive, little-endian, as returned via
+	// dc_dive_callback_t's fingerprint parameter. All-zero means "no
+	// fingerprint set" (a real dive ID is never 0 -- that would be a
+	// 1970 timestamp), matching every other driver's convention.
+	unsigned char fingerprint[4];
 } suunto_nautic_device_t;
 
+static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
 static dc_status_t suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata);
 static dc_status_t suunto_nautic_device_close (dc_device_t *abstract);
 
 static const dc_device_vtable_t suunto_nautic_device_vtable = {
 	sizeof(suunto_nautic_device_t),
 	DC_FAMILY_SUUNTO_NAUTIC,
-	NULL, /* set_fingerprint */
+	suunto_nautic_device_set_fingerprint, /* set_fingerprint */
 	NULL, /* read */
 	NULL, /* write */
 	NULL, /* dump */
@@ -87,6 +94,22 @@ static const dc_device_vtable_t suunto_nautic_device_vtable = {
 	NULL, /* timesync */
 	suunto_nautic_device_close, /* close */
 };
+
+static dc_status_t
+suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size)
+{
+	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+
+	if (size && size != sizeof (device->fingerprint))
+		return DC_STATUS_INVALIDARGS;
+
+	if (size)
+		memcpy (device->fingerprint, data, sizeof (device->fingerprint));
+	else
+		memset (device->fingerprint, 0, sizeof (device->fingerprint));
+
+	return DC_STATUS_SUCCESS;
+}
 
 /*
  * Captured verbatim from a real BLE sniff (libdivecomputer issue #70). The
@@ -228,6 +251,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	}
 
 	device->sequence = 1;
+	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -515,6 +539,7 @@ static dc_status_t
 suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata)
 {
 	dc_status_t status = DC_STATUS_SUCCESS;
+	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
 
 	dc_event_progress_t progress = EVENT_PROGRESS_INITIALIZER;
 	progress.maximum = 2;
@@ -540,22 +565,108 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	device_event_emit (abstract, DC_EVENT_VENDOR, &vendor);
 	dc_buffer_free (mode);
 
-	progress.current = 2;
+	progress.current = 1;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	// dc_device_foreach()'s contract is "enumerate real, decodable dives".
-	// We deliberately do NOT invoke callback() here: enumerating real
-	// logbook entries requires the /Logbook/Entries response format
-	// (unknown — no sample exists anywhere as of this writing), and
-	// synthesizing a placeholder "dive" would either need a fabricated
-	// datetime or would silently fail further down the parser pipeline.
-	// Client applications that want raw diagnostic captures (e.g. to
-	// reverse-engineer /Logbook/Entries, or to download a specific known
-	// dive ID) should call suunto_nautic_device_request() /
-	// suunto_nautic_device_download() directly instead of going through
-	// this generic enumeration entry point.
-	(void) callback;
-	(void) userdata;
+	// /Logbook/Entries returns a flat array of 4-byte little-endian
+	// UInt32 dive IDs -- each one is also a UNIX timestamp (the dive
+	// start time; see suunto_nautic_parser.c's file header for why no
+	// chunk in the decoded profile carries one).
+	dc_buffer_t *entries = dc_buffer_new (0);
+	if (entries == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	status = suunto_nautic_device_request (abstract, "/Logbook/Entries", entries);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (entries);
+		ERROR (abstract->context, "Failed to request /Logbook/Entries.");
+		return status;
+	}
+
+	const unsigned char *entries_data = dc_buffer_get_data (entries);
+	size_t entries_size = dc_buffer_get_size (entries);
+	if (entries_size % 4 != 0) {
+		WARNING (abstract->context, "Unexpected /Logbook/Entries size (" DC_PRINTF_SIZE "), truncating to a multiple of 4.", entries_size);
+		entries_size -= entries_size % 4;
+	}
+	unsigned int count = (unsigned int) (entries_size / 4);
+
+	unsigned int *ids = NULL;
+	if (count > 0) {
+		ids = (unsigned int *) malloc (count * sizeof (unsigned int));
+		if (ids == NULL) {
+			dc_buffer_free (entries);
+			return DC_STATUS_NOMEMORY;
+		}
+		for (unsigned int i = 0; i < count; i++)
+			ids[i] = array_uint32_le (entries_data + i * 4);
+	}
+	dc_buffer_free (entries);
+
+	// Sort descending (newest first). The endpoint's own ordering isn't
+	// documented; since every ID is itself a UNIX timestamp, sorting
+	// ourselves guarantees correct newest-first fingerprint-stop
+	// semantics below regardless of what order the watch actually
+	// returns them in. A plain insertion sort is fine here -- a dive
+	// computer's logbook is realistically dozens to low hundreds of
+	// entries, not a scale where O(n^2) matters.
+	for (unsigned int i = 1; i < count; i++) {
+		unsigned int key = ids[i];
+		int j = (int) i - 1;
+		while (j >= 0 && ids[j] < key) {
+			ids[j + 1] = ids[j];
+			j--;
+		}
+		ids[j + 1] = key;
+	}
+
+	progress.maximum = (count + 1) * 2;
+	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+
+	dc_buffer_t *raw = dc_buffer_new (0);
+	if (raw == NULL) {
+		free (ids);
+		return DC_STATUS_NOMEMORY;
+	}
+
+	for (unsigned int i = 0; i < count; i++) {
+		unsigned char fingerprint[4] = {
+			(unsigned char) (ids[i] & 0xFF),
+			(unsigned char) ((ids[i] >> 8) & 0xFF),
+			(unsigned char) ((ids[i] >> 16) & 0xFF),
+			(unsigned char) ((ids[i] >> 24) & 0xFF),
+		};
+
+		// Walking newest-first, so the first fingerprint match means
+		// everything from here on was already downloaded in a
+		// previous session.
+		if (memcmp (fingerprint, device->fingerprint, sizeof (fingerprint)) == 0)
+			break;
+
+		char logbook_id[16];
+		int n = snprintf (logbook_id, sizeof (logbook_id), "%u", ids[i]);
+		if (n < 0 || (size_t) n >= sizeof (logbook_id))
+			continue;
+
+		dc_buffer_clear (raw);
+		status = suunto_nautic_device_download (abstract, logbook_id, raw);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to download logbook entry %s.", logbook_id);
+			dc_buffer_free (raw);
+			free (ids);
+			return status;
+		}
+
+		progress.current += 2;
+		device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+
+		if (callback && !callback (dc_buffer_get_data (raw), (unsigned int) dc_buffer_get_size (raw),
+			fingerprint, sizeof (fingerprint), userdata))
+			break;
+	}
+
+	dc_buffer_free (raw);
+	free (ids);
 
 	return DC_STATUS_SUCCESS;
 }

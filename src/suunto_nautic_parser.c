@@ -29,15 +29,26 @@
  *   length == 255 means an extended 4-byte little-endian length follows
  *   immediately, before the value.
  *
- * Chunks 0x12 and 0x16 are decoded against real captured data; 0x0B
- * (GPS) is decoded to spec but the reference dive used for
+ * Chunks 0x12, 0x16, and 0x17 are decoded against real captured data;
+ * 0x0B (GPS) is decoded to spec but the reference dive used for
  * verification doesn't contain one, so it's unconfirmed against real
- * bytes. Several other chunk IDs are documented in the issue (0x08
- * activity, 0x0E satellites, 0x14 battery, 0x17 surface pressure,
- * 0x1A/0x1B/0x1C/0x1E dive events, 0x23/0x24 high-frequency IMU) but
- * are not yet wired into dc_field/dc_sample output — unknown chunk IDs
- * are simply skipped, not treated as errors, so extending this later
- * is additive.
+ * bytes. Chunks 0x08 (activity), 0x0E (GPS satellite info), and 0x14
+ * (battery) have confirmed fixed lengths (used for ghost-chunk
+ * resync, see suunto_nautic_sbem_fixed_length) but aren't decoded --
+ * libdivecomputer has no dc_field/dc_sample slot for "activity type,"
+ * "satellite count," or "battery," so there's nothing to wire them to
+ * yet. Chunks 0x23/0x24 are confirmed to be raw accelerometer/
+ * gyroscope dumps used for client-side dead-reckoning to draw a 3D
+ * dive path -- not real GPS/position data -- so they're permanently
+ * out of scope here, not just "not yet done." 0x1A/0x1B/0x1C/0x1E
+ * (dive events: laps, alarms, gas switches) are a harder case: the
+ * chunk IDs for these are NOT fixed constants -- they're assigned
+ * dynamically per dive/device via a schema (SDS::LogbookDecoder
+ * ::setDescriptors in the official Android app) and identified by
+ * path name (e.g. "Events.GasSwitch.GasNumber"), not a hardcoded
+ * numeric ID the way 0x12/0x16/0x0B/0x17 are. Unknown chunk IDs are
+ * simply skipped, not treated as errors, so extending any of this
+ * later is additive.
  *
  * No chunk in this stream carries a wall-clock timestamp. Per a later
  * report on the issue, the dive start time is NOT inside the SBEM
@@ -75,9 +86,13 @@
 
 #define SBEM_MAGIC_SIZE 8
 
+#define CHUNK_ACTIVITY        0x08
 #define CHUNK_GPS             0x0B
-#define CHUNK_PROFILE_1HZ    0x12
+#define CHUNK_GPS_SATELLITES  0x0E
+#define CHUNK_BATTERY         0x14
+#define CHUNK_PROFILE_1HZ     0x12
 #define CHUNK_EXTENDED_STATUS 0x16
+#define CHUNK_SURFACE_PRESSURE 0x17
 
 #define MAX_TANKS 8
 
@@ -100,6 +115,8 @@ typedef struct suunto_nautic_parser_t {
 	suunto_nautic_tank_t tank[MAX_TANKS];
 	unsigned int have_location;
 	dc_location_t location;
+	unsigned int have_atmospheric;
+	double atmospheric; // bar
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -156,9 +173,13 @@ static int
 suunto_nautic_sbem_fixed_length (unsigned int id)
 {
 	switch (id) {
-	case CHUNK_GPS:             return 20;
-	case CHUNK_EXTENDED_STATUS: return 195;
-	default:                    return -1; // unknown or variable length
+	case CHUNK_ACTIVITY:         return 6;
+	case CHUNK_GPS:              return 20;
+	case CHUNK_GPS_SATELLITES:   return 6;
+	case CHUNK_BATTERY:          return 7;
+	case CHUNK_EXTENDED_STATUS:  return 195;
+	case CHUNK_SURFACE_PRESSURE: return 14;
+	default:                     return -1; // unknown or variable length
 	}
 }
 
@@ -235,6 +256,9 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 	unsigned int have_location = 0;
 	dc_location_t location = {0};
+
+	unsigned int have_atmospheric = 0;
+	double atmospheric = 0.0;
 
 	sbem_chunk_t chunk;
 	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) abstract->size, &offset, &chunk)) {
@@ -326,6 +350,23 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				sample.location.altitude = 0.0;
 				callback (DC_SAMPLE_LOCATION, &sample, userdata);
 			}
+		} else if (chunk.id == CHUNK_SURFACE_PRESSURE && chunk.size >= 6) {
+			// 3 Float32 values at offset 2/6/10 (SurfacePressure,
+			// MaxSurfacePressure, MinSurfacePressure), Pa -- offset
+			// 2, not 0: like chunk 0x16's Depth field, there are 2
+			// leading bytes before the data starts. Confirmed against
+			// a real captured chunk: offset 2 = 103662.24, offset 6 =
+			// 103844.73, offset 10 = 101325.0 (standard atmospheric,
+			// exactly), matching the issue's own worked example
+			// (103662.2, 103844.7, 101325.0 Pa) almost to the decimal.
+			// DC_FIELD_ATMOSPHERIC is a single ambient-pressure
+			// reading in bar, so only SurfacePressure (offset 2) is
+			// used -- last one logged wins, matching how e.g.
+			// temperature/depth here track a running min/max rather
+			// than every single reading being independently
+			// meaningful for this field.
+			have_atmospheric = 1;
+			atmospheric = array_float_le (chunk.data + 2) / 100000.0;
 		}
 	}
 
@@ -339,6 +380,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	memcpy (parser->tank, tank, sizeof (tank));
 	parser->have_location = have_location;
 	parser->location = location;
+	parser->have_atmospheric = have_atmospheric;
+	parser->atmospheric = atmospheric;
 	parser->cached = 1;
 
 	return DC_STATUS_SUCCESS;
@@ -399,6 +442,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		if (!parser->have_location)
 			return DC_STATUS_UNSUPPORTED;
 		*((dc_location_t *) value) = parser->location;
+		break;
+	case DC_FIELD_ATMOSPHERIC:
+		if (!parser->have_atmospheric)
+			return DC_STATUS_UNSUPPORTED;
+		*((double *) value) = parser->atmospheric;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
