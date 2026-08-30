@@ -18,7 +18,7 @@ AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_MACRO_DIR([m4])
 
 # Initialize automake.
-AM_INIT_AUTOMAKE([-Wall -Werror foreign])
+AM_INIT_AUTOMAKE([-Wall -Werror foreign subdir-objects])
 
 # Fix for automake >= 1.12
 m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
@@ -46,19 +46,15 @@ AS_IF([test "x$enable_pty" = "xyes"], [
 	AC_DEFINE(ENABLE_PTY, [1], [Enable pseudo terminal support.])
 ])
 
-# Example applications.
-AC_ARG_ENABLE([examples],
-	[AS_HELP_STRING([--enable-examples=@<:@yes/no@:>@],
-		[Build example applications @<:@default=yes@:>@])],
-	[], [enable_examples=yes])
-AM_CONDITIONAL([ENABLE_EXAMPLES], [test "x$enable_examples" = "xyes"])
-
-# Documentation.
-AC_ARG_ENABLE([doc],
-	[AS_HELP_STRING([--enable-doc=@<:@yes/no@:>@],
-		[Build documentation @<:@default=yes@:>@])],
-	[], [enable_doc=yes])
-AM_CONDITIONAL([ENABLE_DOC], [test "x$enable_doc" = "xyes"])
+# Example applications and documentation are NOT configurable in this
+# fork -- examples/ and doc/ were excised entirely from the vendored
+# snapshot this fork was seeded from (see the "Snapshot vendored
+# libdivecomputer" commit), and Automake validates a SUBDIRS entry's
+# directory exists at generation time regardless of any --enable/
+# --disable flag, so there's no way to keep these dirs conditionally
+# configurable without the directories actually existing. Removed
+# rather than left as dead ENABLE_EXAMPLES/ENABLE_DOC flags with
+# nothing in Makefile.am left to guard.
 
 # Checks for programs.
 AC_PROG_CC
@@ -238,10 +234,6 @@ AC_CONFIG_FILES([
    include/libdivecomputer/Makefile
    include/libdivecomputer/version.h
    src/Makefile
-   doc/Makefile
-   doc/doxygen.cfg
-   doc/man/Makefile
-   examples/Makefile
 ])
 AC_OUTPUT
 AC_MSG_NOTICE([
