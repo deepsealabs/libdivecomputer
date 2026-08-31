@@ -199,22 +199,23 @@ suunto_nautic_pack_serial (const char *serial, unsigned char out[12])
 	}
 }
 
-// Builds an EVA/Hello handshake carrying this driver's own identity
-// (SUUNTO_NAUTIC_OWN_SERIAL) instead of replaying the original capture's
-// borrowed identity verbatim. See the comment above for what is and
-// isn't re-derived.
+// Builds the EVA/Hello handshake. Temporarily sends the original captured
+// template verbatim instead of substituting this driver's own identity
+// (SUUNTO_NAUTIC_OWN_SERIAL, via suunto_nautic_pack_serial() below): a real
+// Suunto Nautic (issue #29, tester urbamax) failed to respond at all to the
+// self-built identity, while that same tester's independently-written
+// Python client authenticates successfully against that same watch by
+// replaying this exact template unmodified. The decompiled "any valid
+// identity works" theory (see the comment above) is therefore unverified
+// against real hardware where it counts, and the verbatim bytes are
+// empirically proven to work -- until the self-built identity is confirmed
+// against a real device, sending it is a regression, not an improvement.
+// suunto_nautic_pack_serial() is left in place to re-enable once that
+// happens; see suunto_nautic.h for tracking.
 static void
 suunto_nautic_build_eva_handshake (unsigned char packet[EVA_HANDSHAKE_SIZE])
 {
-	unsigned char serial[12];
-	suunto_nautic_pack_serial (SUUNTO_NAUTIC_OWN_SERIAL, serial);
-
 	memcpy (packet, suunto_nautic_eva_handshake_template, EVA_HANDSHAKE_SIZE);
-	memcpy (packet + EVA_SERIAL_OFFSET, serial, 8);
-	memcpy (packet + EVA_SERIAL_ECHO_OFFSET, serial + 1, 4);
-
-	unsigned int crc = checksum_crc32r (packet, EVA_CRC_OFFSET);
-	array_uint32_le_set (packet + EVA_CRC_OFFSET, crc);
 }
 
 /*

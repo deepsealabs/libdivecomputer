@@ -112,18 +112,20 @@
  *
  *   - The "EVA" handshake (really the Whiteboard protocol's own Hello
  *     message — see suunto_nautic_build_eva_handshake() in
- *     suunto_nautic.c for the full derivation) now carries this
- *     driver's own identity instead of replaying a phone's captured
- *     one verbatim: decompiling the official Android app's libmds.so
- *     showed the protocol-version and capability-flags bytes are fixed
- *     build constants (confirmed byte-for-byte against the real
- *     capture) and the sender-identity bytes follow a fully
- *     reimplementable packing scheme with no cryptographic tie to a
- *     specific phone. Every field is now understood except one byte,
- *     which is provably inconsequential (a client-side connection-pool
- *     slot index the watch never validates — see that function's
- *     comment) rather than unknown. This is now closer to derived than
- *     replayed, but still unverified against real hardware.
+ *     suunto_nautic.c for the full derivation) was reworked to carry
+ *     this driver's own identity instead of replaying a phone's
+ *     captured one verbatim, on the theory (from decompiling the
+ *     official Android app's libmds.so) that the sender-identity bytes
+ *     follow a fully reimplementable packing scheme with no
+ *     cryptographic tie to a specific phone. That theory has since
+ *     failed its first real-hardware test: a tester (issue #29,
+ *     urbamax) got no response at all from a real Nautic when sent the
+ *     self-built identity, while that same tester's own independently-
+ *     written client authenticates fine against that same watch by
+ *     replaying the original captured template unmodified. The driver
+ *     currently sends the verbatim template again (self-built-identity
+ *     code is left in place, just unused) until the theory — or a bug
+ *     in its reimplementation — is sorted out against real hardware.
  *
  * A later issue update confirmed several things independently derived
  * above, and clarified two more:
