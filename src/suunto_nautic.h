@@ -119,9 +119,10 @@
  *     build constants (confirmed byte-for-byte against the real
  *     capture) and the sender-identity bytes follow a fully
  *     reimplementable packing scheme with no cryptographic tie to a
- *     specific phone. Two small regions of the payload are still
- *     replayed as literal constants because they aren't understood
- *     (see that function's comment) — this is closer to derived than
+ *     specific phone. Every field is now understood except one byte,
+ *     which is provably inconsequential (a client-side connection-pool
+ *     slot index the watch never validates — see that function's
+ *     comment) rather than unknown. This is now closer to derived than
  *     replayed, but still unverified against real hardware.
  *
  * A later issue update confirmed several things independently derived

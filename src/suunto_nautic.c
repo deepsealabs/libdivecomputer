@@ -138,12 +138,19 @@ suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char
  *     that formula yields 0x03, which likewise matches the real
  *     captured byte exactly.
  *
- * Two regions are NOT re-derived and are still replayed as literal
- * constants from the original capture: offset 8 (a byte sourced from
- * the sender's RoutingTableEntry state, not identity -- believed
- * inconsequential to the watch) and the header framing itself (sync
- * byte, message type, length encoding), which was already understood
- * before this. suunto_nautic_build_eva_handshake() rebuilds only the
+ * One region is NOT re-derived and is still replayed as a literal
+ * constant from the original capture: offset 8. Decompiling
+ * whiteboard::RoutingTable::addRoute() resolved what it is --
+ * `pSVar12[0x24] = pool_slot + 1`, where pool_slot comes from
+ * Pool::allocate() on the sender's own internal connection-pool
+ * allocator. It is never sent for the watch's benefit and nothing
+ * validates it, so unlike the identity bytes there is no "correct"
+ * value to derive here -- any byte works identically, which is why it
+ * is left as a literal constant rather than computed. (The header
+ * framing itself -- sync byte, message type, length encoding -- was
+ * already understood before this and isn't "unknown," just not
+ * dynamically recomputed since none of it varies for this fixed-size
+ * payload.) suunto_nautic_build_eva_handshake() rebuilds only the
  * two regions now known to carry the sender's own SuuntoSerial (the 8
  * bytes at offset 9, and a 4-byte second copy of serial bytes 1-4 at
  * offset 17, per sendHandshake()'s own logic) using our own identity,
