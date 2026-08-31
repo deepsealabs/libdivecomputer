@@ -367,6 +367,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	unsigned char eva_handshake[EVA_HANDSHAKE_SIZE];
 	suunto_nautic_build_eva_handshake (eva_handshake);
 
+	HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA REQ", eva_handshake, sizeof (eva_handshake));
+
 	status = dc_iostream_write (device->iostream, eva_handshake, sizeof (eva_handshake), NULL);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to send the EVA handshake.");
