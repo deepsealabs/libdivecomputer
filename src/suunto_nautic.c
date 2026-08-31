@@ -39,7 +39,7 @@
 // submodule, which can drift out of sync with the Swift package's own
 // build tag if a `git pull` doesn't also update the submodule -- when the
 // two tags disagree in a log, that's exactly what happened.
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-08-31-entries-short-fetch"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-08-31-skip-empty-entries"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -953,10 +953,16 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 		dc_buffer_clear (raw);
 		status = suunto_nautic_device_download (abstract, logbook_id, raw);
 		if (status != DC_STATUS_SUCCESS) {
-			ERROR (abstract->context, "Failed to download logbook entry %s.", logbook_id);
-			dc_buffer_free (raw);
-			free (ids);
-			return status;
+			// A logbook can contain empty/aborted entries (e.g. a
+			// zero-length session): /Logbook/Entries lists their id, but
+			// downloading them yields no profile data and fails the SBEM
+			// magic check. Skip such an entry with a warning rather than
+			// aborting the whole enumeration -- one bad entry shouldn't
+			// stop every later dive from syncing. (Confirmed on real
+			// hardware, issue #29: id 1787754346 returned 0 bytes.)
+			WARNING (abstract->context, "Skipping logbook entry %s (download failed, likely an empty/aborted dive).", logbook_id);
+			status = DC_STATUS_SUCCESS;
+			continue;
 		}
 
 		progress.current += 2;
