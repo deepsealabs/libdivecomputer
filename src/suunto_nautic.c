@@ -34,6 +34,13 @@
 
 // See suunto_nautic.h for the full picture of what is/isn't understood.
 
+// Logged (INFO) on every device open so a tester's log proves which C
+// driver build is actually running. This lives in the libdivecomputer
+// submodule, which can drift out of sync with the Swift package's own
+// build tag if a `git pull` doesn't also update the submodule -- when the
+// two tags disagree in a log, that's exactly what happened.
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-08-31-entries-short-fetch"
+
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
 #define RPC_OP_FETCH         0x0D
@@ -396,6 +403,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		ERROR (context, "Failed to allocate memory.");
 		return DC_STATUS_NOMEMORY;
 	}
+
+	INFO (context, "Suunto Nautic C driver build %s", SUUNTO_NAUTIC_DRIVER_TAG);
 
 	device->sequence = 1;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
