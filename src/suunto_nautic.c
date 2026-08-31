@@ -495,28 +495,35 @@ done:
 	return status;
 }
 
-dc_status_t
-suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *raw)
+// Performs the GET -> ACK(watch magic) -> FETCH1 -> FETCH2 -> stream-collect
+// sequence common to every endpoint whose payload doesn't fit in a single
+// ACK (dive data, and now logbook entries -- see suunto_nautic_device_foreach()).
+// suunto_nautic_device_request() alone only performs the GET and reads the
+// ACK; treating that ACK as the payload (as /Logbook/Entries used to) reads
+// Handle/session bytes as if they were the real response, which is why
+// entries used to come back as a couple of nonsense IDs instead of the
+// actual logbook.
+//
+// Returns the raw, MDS-chunk-stripped bytes -- still Heatshrink-compressed
+// for endpoints known to compress their payload (Data/Summary); Entries is
+// not documented as compressed, so callers use the bytes directly. This
+// path (the FETCH1/FETCH2 stream-fetch, not just the GET+ACK) has only ever
+// been exercised for /Logbook/byId/.../Data via an offline replay of a
+// captured stream, and for /Logbook/Entries not at all yet -- see issue #29.
+static dc_status_t
+suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *raw)
 {
-	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || raw == NULL)
-		return DC_STATUS_INVALIDARGS;
-
 	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
 	dc_status_t status = DC_STATUS_SUCCESS;
 
-	char path[128];
-	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Data", logbook_id);
-	if (n < 0 || (size_t) n >= sizeof (path))
-		return DC_STATUS_INVALIDARGS;
-
-	// 1. Request the file. The watch acknowledges with its own "Watch
+	// 1. Request the resource. The watch acknowledges with its own "Watch
 	// Magic": a session id it generates specifically to authorize this
-	// transfer, returned as a little-endian UInt32 at offset 5 in the
-	// ACK response. The stream-fetch triggers below need Watch_Magic+1
-	// and +2, not our own request sequence -- confirmed independently on
-	// issue #29. Previously this used device->sequence for both, which
-	// only worked because it happened to match the watch's magic in the
-	// one captured session this was originally derived from.
+	// transfer, returned as a little-endian UInt32 at offset 5 in the ACK
+	// response. The stream-fetch triggers below need Watch_Magic+1 and
+	// +2, not our own request sequence -- confirmed independently on
+	// issue #29. Previously the Data path used device->sequence for both,
+	// which only worked because it happened to match the watch's magic in
+	// the one captured session this was originally derived from.
 	dc_buffer_t *ack = dc_buffer_new (0);
 	if (ack == NULL)
 		return DC_STATUS_NOMEMORY;
@@ -524,7 +531,7 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	status = suunto_nautic_device_request (abstract, path, ack);
 	if (status != DC_STATUS_SUCCESS) {
 		dc_buffer_free (ack);
-		ERROR (abstract->context, "Failed to request the logbook entry.");
+		ERROR (abstract->context, "Failed to request %s.", path);
 		return status;
 	}
 
@@ -565,11 +572,11 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	}
 
 	// 3. Capture the MDS chunk frames (opcode 0x01) and pull out each
-	// one's true compressed sub-payload: the MDS header is 28 bytes, and
-	// the payload size is a little-endian u16 at offset 20-21 (see the
-	// MDS_HEADER_SIZE comment above). The concatenation of these
-	// sub-payloads across all chunks is one continuous Heatshrink stream
-	// — chunk boundaries are purely a BLE/transport artifact, not
+	// one's true sub-payload: the MDS header is 28 bytes, and the payload
+	// size is a little-endian u16 at offset 20-21 (see the MDS_HEADER_SIZE
+	// comment above). For a compressed endpoint, the concatenation of
+	// these sub-payloads across all chunks is one continuous Heatshrink
+	// stream — chunk boundaries are purely a BLE/transport artifact, not
 	// boundaries in the compressed data.
 	//
 	// Per the issue's follow-up report, the watch does not need to be
@@ -584,10 +591,6 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 		return status;
 	}
 
-	dc_buffer_t *compressed = dc_buffer_new (0);
-	if (compressed == NULL)
-		return DC_STATUS_NOMEMORY;
-
 	for (unsigned int i = 0; i < MAX_CHUNKS; i++) {
 		unsigned char packet[MAX_PACKET] = {0};
 		size_t len = 0;
@@ -596,7 +599,6 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 			if (status == DC_STATUS_TIMEOUT)
 				break;
 			ERROR (abstract->context, "Failed to receive a stream chunk.");
-			dc_buffer_free (compressed);
 			return status;
 		}
 
@@ -618,18 +620,43 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 				continue;
 			}
 
-			if (!dc_buffer_append (compressed, packet + MDS_HEADER_SIZE, chunk_size)) {
+			if (!dc_buffer_append (raw, packet + MDS_HEADER_SIZE, chunk_size)) {
 				ERROR (abstract->context, "Failed to allocate memory.");
-				dc_buffer_free (compressed);
 				return DC_STATUS_NOMEMORY;
 			}
 		}
 	}
 
+	return DC_STATUS_SUCCESS;
+}
+
+dc_status_t
+suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *raw)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || raw == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	char path[128];
+	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Data", logbook_id);
+	if (n < 0 || (size_t) n >= sizeof (path))
+		return DC_STATUS_INVALIDARGS;
+
+	dc_buffer_t *compressed = dc_buffer_new (0);
+	if (compressed == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	status = suunto_nautic_device_stream_fetch (abstract, path, compressed);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (compressed);
+		return status;
+	}
+
 	DEBUG (abstract->context, "Captured " DC_PRINTF_SIZE " compressed bytes for logbook entry %s.",
 		dc_buffer_get_size (compressed), logbook_id);
 
-	// 4. Decompress and verify the SBEM0103 magic.
+	// Decompress and verify the SBEM0103 magic.
 	status = suunto_nautic_heatshrink_decompress (abstract->context,
 		dc_buffer_get_data (compressed), dc_buffer_get_size (compressed), raw);
 	dc_buffer_free (compressed);
@@ -691,10 +718,10 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	if (entries == NULL)
 		return DC_STATUS_NOMEMORY;
 
-	status = suunto_nautic_device_request (abstract, "/Logbook/Entries", entries);
+	status = suunto_nautic_device_stream_fetch (abstract, "/Logbook/Entries", entries);
 	if (status != DC_STATUS_SUCCESS) {
 		dc_buffer_free (entries);
-		ERROR (abstract->context, "Failed to request /Logbook/Entries.");
+		ERROR (abstract->context, "Failed to fetch /Logbook/Entries.");
 		return status;
 	}
 

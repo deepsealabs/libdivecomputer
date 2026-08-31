@@ -105,10 +105,14 @@
  *     ordering isn't documented, so this is done client-side since
  *     every ID is itself a UNIX timestamp — see below), and downloads
  *     each one in turn, stopping at the first ID matching the stored
- *     fingerprint. dc_device_foreach() therefore works end-to-end for
- *     this family now, unlike what some downstream comments (Swift
- *     layer, NauticTestApp) still say — those predate this and need
- *     updating to match, not the other way around.
+ *     fingerprint. Real-hardware testing (issue #29) caught that this
+ *     used to only perform the GET+ACK step and read the ACK's own
+ *     Handle/session bytes as if they were the entries array, never
+ *     actually fetching the real payload — /Logbook/Entries needs the
+ *     same GET -> ACK(watch magic) -> FETCH1 -> FETCH2 -> stream-collect
+ *     sequence as dive data download, now factored out as
+ *     suunto_nautic_device_stream_fetch() and shared by both. Not yet
+ *     re-verified against real hardware after that fix.
  *
  *   - The "EVA" handshake (really the Whiteboard protocol's own Hello
  *     message — see suunto_nautic_build_eva_handshake() in
