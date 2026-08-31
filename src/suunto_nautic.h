@@ -99,37 +99,21 @@
  *     MinSurfacePressure as 3 Float32 Pa values) is also decoded, into
  *     DC_FIELD_ATMOSPHERIC — confirmed against a real captured chunk
  *     matching the issue's own worked example to the decimal.
- *   - Dive enumeration: suunto_nautic_device_foreach() requests
- *     /Logbook/Entries (a flat array of 4-byte little-endian UInt32
- *     dive IDs), sorts the results newest-first (the endpoint's own
- *     ordering isn't documented, so this is done client-side since
- *     every ID is itself a UNIX timestamp — see below), and downloads
- *     each one in turn, stopping at the first ID matching the stored
- *     fingerprint. Real-hardware testing (issue #29) caught that this
- *     used to only perform the GET+ACK step and read the ACK's own
- *     Handle/session bytes as if they were the entries array, never
- *     actually fetching the real payload — /Logbook/Entries needs the
- *     same GET -> ACK(watch magic) -> FETCH1 -> FETCH2 -> stream-collect
- *     sequence as dive data download, now factored out as
- *     suunto_nautic_device_stream_fetch() and shared by both. Not yet
- *     re-verified against real hardware after that fix.
+ *   - Dive enumeration: suunto_nautic_device_foreach() fetches
+ *     /Logbook/Entries (via the short 0x0D fetch — the listing endpoint
+ *     rejects the stream-fetch used for dive data), extracting each
+ *     dive's LogId from the small SBEM payload with a timestamp-window
+ *     filter, sorts newest-first (every ID is itself a UNIX timestamp),
+ *     and downloads each in turn, stopping at the first ID matching the
+ *     stored fingerprint. Verified working against real hardware.
  *
  *   - The "EVA" handshake (really the Whiteboard protocol's own Hello
  *     message — see suunto_nautic_build_eva_handshake() in
- *     suunto_nautic.c for the full derivation) was reworked to carry
- *     this driver's own identity instead of replaying a phone's
- *     captured one verbatim, on the theory (from decompiling the
- *     official Android app's libmds.so) that the sender-identity bytes
- *     follow a fully reimplementable packing scheme with no
- *     cryptographic tie to a specific phone. That theory has since
- *     failed its first real-hardware test: a tester (issue #29,
- *     urbamax) got no response at all from a real Nautic when sent the
- *     self-built identity, while that same tester's own independently-
- *     written client authenticates fine against that same watch by
- *     replaying the original captured template unmodified. The driver
- *     currently sends the verbatim template again (self-built-identity
- *     code is left in place, just unused) until the theory — or a bug
- *     in its reimplementation — is sorted out against real hardware.
+ *     suunto_nautic.c) sends the original captured template verbatim.
+ *     A reworked version that builds this driver's own identity (on the
+ *     theory, from decompiling libmds.so, that any valid identity works)
+ *     got no response from a real device, so the verbatim bytes are used;
+ *     the self-built-identity code is left in place but unused.
  *
  * A later issue update confirmed several things independently derived
  * above, and clarified two more:

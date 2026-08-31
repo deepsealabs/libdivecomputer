@@ -59,16 +59,11 @@ dc_status_t
 suunto_nautic_device_request (dc_device_t *device, const char *path, dc_buffer_t *response);
 
 /*
- * Fetch the full payload of an RPC endpoint whose response doesn't fit
- * in a single ACK (e.g. "/Logbook/Entries",
- * "/Logbook/UnsynchronisedLogs"). Unlike suunto_nautic_device_request(),
- * which only performs the GET and returns the ACK, this runs the full
- * GET -> ACK(watch magic) -> FETCH1 -> FETCH2 -> stream-collect sequence
- * and returns the concatenated, MDS-chunk-stripped payload. The bytes
- * are NOT decompressed (callers that need Heatshrink decompression, like
- * dive data, should use suunto_nautic_device_download()); endpoints that
- * return an uncompressed array (the logbook listings) can use the result
- * directly.
+ * Fetch a small whole resource whose response doesn't fit in a single ACK
+ * (e.g. "/Logbook/Entries", "/Logbook/UnsynchronisedLogs"). Unlike
+ * suunto_nautic_device_request(), which returns only the ACK, this runs the
+ * GET -> ACK -> short fetch -> data sequence and returns the raw response.
+ * Not for compressed/paginated dive data -- use suunto_nautic_device_download().
  */
 dc_status_t
 suunto_nautic_device_fetch (dc_device_t *device, const char *path, dc_buffer_t *response);

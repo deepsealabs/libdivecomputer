@@ -34,11 +34,9 @@
 
 // See suunto_nautic.h for the full picture of what is/isn't understood.
 
-// Logged (INFO) on every device open so a tester's log proves which C
-// driver build is actually running. This lives in the libdivecomputer
-// submodule, which can drift out of sync with the Swift package's own
-// build tag if a `git pull` doesn't also update the submodule -- when the
-// two tags disagree in a log, that's exactly what happened.
+// Logged (INFO) on every device open so a log proves which C driver build
+// is running (this submodule can lag the Swift package if a pull doesn't
+// update it).
 #define SUUNTO_NAUTIC_DRIVER_TAG "2026-08-31-skip-empty-entries"
 
 #define RPC_OP_GET           0x0A
@@ -61,13 +59,11 @@
 #define MAX_PATH    240
 #define MAX_PACKET  512
 
-// Dive IDs are UNIX timestamps. /Logbook/Entries returns them as 4-byte-
-// aligned little-endian uint32 values embedded in a small SBEM payload
-// alongside handle/flag/count/CRC fields; filtering to a plausible
-// timestamp window (2017-07 .. 2036-07) cleanly isolates the IDs, which is
-// how the reference client extracts them too. Must scan 4-aligned: the IDs
-// are packed adjacently, so an unaligned read straddling two of them can
-// land inside the same window and invent a phantom dive.
+// Dive IDs are UNIX timestamps. /Logbook/Entries embeds them as 4-aligned
+// little-endian uint32 values in a small SBEM payload among handle/flag/
+// count/CRC fields; filtering to a plausible timestamp window (2017 .. 2036)
+// isolates them. Must scan 4-aligned -- the IDs are packed adjacently, so an
+// unaligned read straddling two can invent a phantom dive.
 #define DIVE_ID_MIN 1500000000u
 #define DIVE_ID_MAX 2100000000u
 
@@ -226,19 +222,12 @@ suunto_nautic_pack_serial (const char *serial, unsigned char out[12])
 	}
 }
 
-// Builds the EVA/Hello handshake. Temporarily sends the original captured
-// template verbatim instead of substituting this driver's own identity
-// (SUUNTO_NAUTIC_OWN_SERIAL, via suunto_nautic_pack_serial() below): a real
-// Suunto Nautic (issue #29, tester urbamax) failed to respond at all to the
-// self-built identity, while that same tester's independently-written
-// Python client authenticates successfully against that same watch by
-// replaying this exact template unmodified. The decompiled "any valid
-// identity works" theory (see the comment above) is therefore unverified
-// against real hardware where it counts, and the verbatim bytes are
-// empirically proven to work -- until the self-built identity is confirmed
-// against a real device, sending it is a regression, not an improvement.
-// suunto_nautic_pack_serial() is left in place to re-enable once that
-// happens; see suunto_nautic.h for tracking.
+// Builds the EVA/Hello handshake. Sends the original captured template
+// verbatim rather than substituting this driver's own identity: real
+// hardware only responds to the verbatim bytes, while the decompiled
+// "any valid identity works" theory (see the comment above) is unverified
+// on a device. suunto_nautic_pack_serial() is kept below to re-enable the
+// self-built identity once that's confirmed.
 static void
 suunto_nautic_build_eva_handshake (unsigned char packet[EVA_HANDSHAKE_SIZE])
 {
@@ -323,11 +312,10 @@ suunto_nautic_build_stream_fetch (unsigned char packet[], unsigned int size, uns
 // Build the "short" fetch (opcode 0x0D) the official app uses to read a
 // small whole resource in one shot, e.g. /Logbook/Entries. Payload is
 // [seq:2 LE][handle:3][01 80 00 00] -- the trailing 01 80 00 00 is the
-// no-range form. This is deliberately NOT the ranged fetch used for large
-// paginated resources (Summary/Data), whose payload ends 01 80 00 01 06 00
-// [offset:4]; sending that ranged form to /Logbook/Entries makes the watch
-// reject it with a 400 Bad Request (verified against a real device and the
-// official-app capture, issue #29).
+// no-range form. NOT the ranged fetch used for large paginated resources
+// (Summary/Data), whose payload ends 01 80 00 01 06 00 [offset:4]; sending
+// that ranged form to /Logbook/Entries makes the watch reject it with a
+// 400 Bad Request.
 static dc_status_t
 suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
 	unsigned int seq, const unsigned char handle[3])
@@ -558,34 +546,18 @@ done:
 }
 
 // Performs the GET -> ACK(watch magic) -> FETCH1 -> FETCH2 -> stream-collect
-// sequence common to every endpoint whose payload doesn't fit in a single
-// ACK (dive data, and now logbook entries -- see suunto_nautic_device_foreach()).
-// suunto_nautic_device_request() alone only performs the GET and reads the
-// ACK; treating that ACK as the payload (as /Logbook/Entries used to) reads
-// Handle/session bytes as if they were the real response, which is why
-// entries used to come back as a couple of nonsense IDs instead of the
-// actual logbook.
-//
-// Returns the raw, MDS-chunk-stripped bytes -- still Heatshrink-compressed
-// for endpoints known to compress their payload (Data/Summary); Entries is
-// not documented as compressed, so callers use the bytes directly. This
-// path (the FETCH1/FETCH2 stream-fetch, not just the GET+ACK) has only ever
-// been exercised for /Logbook/byId/.../Data via an offline replay of a
-// captured stream, and for /Logbook/Entries not at all yet -- see issue #29.
+// sequence used to pull a large paginated resource (dive data). Returns the
+// raw, MDS-chunk-stripped, still-Heatshrink-compressed bytes. Small listing
+// endpoints use suunto_nautic_device_short_fetch() instead.
 static dc_status_t
 suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *raw)
 {
 	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
 	dc_status_t status = DC_STATUS_SUCCESS;
 
-	// 1. Request the resource. The watch acknowledges with its own "Watch
-	// Magic": a session id it generates specifically to authorize this
-	// transfer, returned as a little-endian UInt32 at offset 5 in the ACK
-	// response. The stream-fetch triggers below need Watch_Magic+1 and
-	// +2, not our own request sequence -- confirmed independently on
-	// issue #29. Previously the Data path used device->sequence for both,
-	// which only worked because it happened to match the watch's magic in
-	// the one captured session this was originally derived from.
+	// 1. Request the resource. The watch's ACK carries a "Watch Magic"
+	// session id (little-endian UInt32 at offset 5) that authorizes this
+	// transfer; the two stream-fetch triggers below use Watch_Magic+1/+2.
 	dc_buffer_t *ack = dc_buffer_new (0);
 	if (ack == NULL)
 		return DC_STATUS_NOMEMORY;
@@ -692,16 +664,12 @@ suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_b
 	return DC_STATUS_SUCCESS;
 }
 
-// Fetch a small whole resource (e.g. /Logbook/Entries) using the official
-// app's GET -> ACK(handle) -> SHORT-FETCH(0x0D) -> DATA(0x05) flow. Unlike
-// suunto_nautic_device_stream_fetch()'s 0x0B/0x10 triggers (which the watch
-// answers for the listing endpoints with control frames carrying no data),
-// this uses the no-range 0x0D fetch the watch actually serves the listing
-// with. `response` receives the raw DATA-frame content (the bytes after the
-// A5 05 sublen header, including the 10-byte REST sub-header and trailing
-// CRC), matching the layout the reference client parses. Assumes the whole
-// resource fits in one DATA frame -- true for a normal logbook; a status of
-// 100 (more pages) is surfaced as a warning rather than silently truncating.
+// Fetch a small whole resource (e.g. /Logbook/Entries) via the official
+// app's GET -> ACK(handle) -> SHORT-FETCH(0x0D) -> DATA(0x05) flow. The
+// listing endpoints don't answer the 0x0B/0x10 stream-fetch triggers, only
+// this no-range 0x0D form. `response` receives the raw DATA-frame content
+// (everything after the A5 05 sublen header). Assumes the resource fits in
+// one DATA frame, which holds for a normal logbook.
 static dc_status_t
 suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
 {
@@ -767,8 +735,7 @@ suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_bu
 		return DC_STATUS_PROTOCOL;
 	}
 
-	// Return the frame content (everything after A5 05 sublen), matching what
-	// the reference client parses for the entries listing.
+	// Return the frame content (everything after A5 05 sublen).
 	dc_buffer_clear (response);
 	if (!dc_buffer_append (response, packet + 4, len - 4)) {
 		ERROR (abstract->context, "Failed to allocate memory.");
@@ -868,12 +835,10 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
 	// /Logbook/Entries returns a small SBEM payload embedding each dive's
-	// LogId (a UNIX timestamp) as a 4-aligned little-endian uint32,
-	// alongside handle/flag/count/CRC fields. The IDs are isolated by a
-	// timestamp-window filter (see DIVE_ID_MIN/MAX); this is the endpoint's
-	// documented behaviour, not a flat ID array as an earlier version of
-	// this driver assumed. Uses the short 0x0D fetch -- the watch rejects
-	// the ranged stream-fetch (used for dive data) for this endpoint.
+	// LogId (a UNIX timestamp) as a 4-aligned little-endian uint32 among
+	// handle/flag/count/CRC fields; a timestamp-window filter (DIVE_ID_MIN/
+	// MAX) isolates the IDs. Uses the short 0x0D fetch -- the watch rejects
+	// the ranged stream-fetch (used for dive data) here.
 	dc_buffer_t *entries = dc_buffer_new (0);
 	if (entries == NULL)
 		return DC_STATUS_NOMEMORY;
@@ -953,13 +918,10 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 		dc_buffer_clear (raw);
 		status = suunto_nautic_device_download (abstract, logbook_id, raw);
 		if (status != DC_STATUS_SUCCESS) {
-			// A logbook can contain empty/aborted entries (e.g. a
-			// zero-length session): /Logbook/Entries lists their id, but
-			// downloading them yields no profile data and fails the SBEM
-			// magic check. Skip such an entry with a warning rather than
-			// aborting the whole enumeration -- one bad entry shouldn't
-			// stop every later dive from syncing. (Confirmed on real
-			// hardware, issue #29: id 1787754346 returned 0 bytes.)
+			// A logbook can contain empty/aborted entries (a zero-length
+			// session is listed in /Logbook/Entries but downloads to no
+			// profile data and fails the SBEM magic check). Skip with a
+			// warning rather than aborting the whole enumeration.
 			WARNING (abstract->context, "Skipping logbook entry %s (download failed, likely an empty/aborted dive).", logbook_id);
 			status = DC_STATUS_SUCCESS;
 			continue;
