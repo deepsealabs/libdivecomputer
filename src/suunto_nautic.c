@@ -112,18 +112,103 @@ suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char
 }
 
 /*
- * Captured verbatim from a real BLE sniff (libdivecomputer issue #70). The
- * EVA payload negotiates capabilities before any endpoint can be reached;
- * we don't know how to construct it generically, so it is replayed as-is.
- * Whether it is universal across all Nautic/Ocean units or session-
- * specific is unconfirmed.
+ * The "EVA" handshake is really the Whiteboard protocol's own Hello
+ * message (message type 0x12; a peer replying in kind, rather than a
+ * fixed ack, is what "EVA" was originally mistaken for a no-ack magic
+ * blob). Decompiling whiteboard::WhiteboardCommunication::sendHandshake()
+ * and whiteboard::SuuntoSerial::{isValid,pack,unpack}() out of the
+ * official Android app's libmds.so (build 6.7.12-6007012) showed that
+ * every field in this payload is derivable rather than borrowed from
+ * whoever's phone captured the original session:
+ *
+ *   - SuuntoSerial::isValid() accepts any 1-16 character string drawn
+ *     from [0-9A-Z] -- there is no cryptographic tie to a specific
+ *     phone or account. suunto_nautic_pack_serial() below reimplements
+ *     SuuntoSerial::pack()'s bit layout so this driver can use its own
+ *     identity (SUUNTO_NAUTIC_OWN_SERIAL) instead of impersonating the
+ *     phone that produced the originally captured bytes.
+ *   - The Whiteboard protocol-version bytes (offsets 21-28 below) come
+ *     from GetWhiteboardVersion(), which in this build parses a
+ *     hardcoded "00000000" string rather than anything session-
+ *     specific -- a fixed build constant, confirmed byte-for-byte
+ *     against the real captured handshake (04 01 02 00 00 00 00 00).
+ *   - The capability-flags byte (offset 29) is derived from a *static*
+ *     BleAdapter::Traits table baked into the binary (byte value 0x0F)
+ *     via a small bit formula in sendHandshake(); running 0x0F through
+ *     that formula yields 0x03, which likewise matches the real
+ *     captured byte exactly.
+ *
+ * Two regions are NOT re-derived and are still replayed as literal
+ * constants from the original capture: offset 8 (a byte sourced from
+ * the sender's RoutingTableEntry state, not identity -- believed
+ * inconsequential to the watch) and the header framing itself (sync
+ * byte, message type, length encoding), which was already understood
+ * before this. suunto_nautic_build_eva_handshake() rebuilds only the
+ * two regions now known to carry the sender's own SuuntoSerial (the 8
+ * bytes at offset 9, and a 4-byte second copy of serial bytes 1-4 at
+ * offset 17, per sendHandshake()'s own logic) using our own identity,
+ * then recomputes the trailing CRC32. This has not been tested against
+ * real hardware -- see the request to testers in NauticTestApp/README.md.
  */
-static const unsigned char suunto_nautic_eva_handshake[] = {
+#define SUUNTO_NAUTIC_OWN_SERIAL "LIBDIVECOMPUTER"
+
+static const unsigned char suunto_nautic_eva_handshake_template[] = {
 	0xA5, 0x12, 0x20, 0x00, 0x00, 0x00, 0x09, 0x09, 0x20, 0x16, 0x45, 0x56,
 	0x41, 0x10, 0x04, 0x41, 0x10, 0x0C, 0x00, 0x00, 0x00, 0x04, 0x01, 0x02,
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x00, 0x00, 0x63, 0x1B, 0x47, 0x1B
 };
+
+#define EVA_HANDSHAKE_SIZE       (sizeof (suunto_nautic_eva_handshake_template))
+#define EVA_SERIAL_OFFSET        9  // 8 bytes: own SuuntoSerial, raw
+#define EVA_SERIAL_ECHO_OFFSET   17 // 4 bytes: own SuuntoSerial bytes 1-4, again
+#define EVA_CRC_OFFSET           38 // 4 bytes, LE, over bytes [0, EVA_CRC_OFFSET)
+
+// Packs an uppercase-alphanumeric serial string into the 12-byte
+// SuuntoSerial wire representation, reimplementing
+// whiteboard::SuuntoSerial::pack() from libmds.so: four characters at a
+// time, each mapped to a 6-bit value (char - '/'), three bytes per
+// group:
+//   byte0 = v0 | (v1 << 6)
+//   byte1 = (v1 >> 2) | (v2 << 4)
+//   byte2 = (v2 >> 4) | (v3 << 2)
+// A group with fewer than 4 remaining characters treats the missing
+// ones as 0, matching the real implementation.
+static void
+suunto_nautic_pack_serial (const char *serial, unsigned char out[12])
+{
+	memset (out, 0, 12);
+
+	size_t len = strlen (serial);
+	for (size_t i = 0; i < 16 && i < len; i += 4) {
+		unsigned int v[4] = {0, 0, 0, 0};
+		for (size_t j = 0; j < 4 && i + j < len; j++)
+			v[j] = (unsigned char) serial[i + j] - 0x2F;
+
+		unsigned char *dst = out + (i / 4) * 3;
+		dst[0] = (unsigned char) (v[0] | (v[1] << 6));
+		dst[1] = (unsigned char) ((v[1] >> 2) | (v[2] << 4));
+		dst[2] = (unsigned char) ((v[2] >> 4) | (v[3] << 2));
+	}
+}
+
+// Builds an EVA/Hello handshake carrying this driver's own identity
+// (SUUNTO_NAUTIC_OWN_SERIAL) instead of replaying the original capture's
+// borrowed identity verbatim. See the comment above for what is and
+// isn't re-derived.
+static void
+suunto_nautic_build_eva_handshake (unsigned char packet[EVA_HANDSHAKE_SIZE])
+{
+	unsigned char serial[12];
+	suunto_nautic_pack_serial (SUUNTO_NAUTIC_OWN_SERIAL, serial);
+
+	memcpy (packet, suunto_nautic_eva_handshake_template, EVA_HANDSHAKE_SIZE);
+	memcpy (packet + EVA_SERIAL_OFFSET, serial, 8);
+	memcpy (packet + EVA_SERIAL_ECHO_OFFSET, serial + 1, 4);
+
+	unsigned int crc = checksum_crc32r (packet, EVA_CRC_OFFSET);
+	array_uint32_le_set (packet + EVA_CRC_OFFSET, crc);
+}
 
 /*
  * Also captured verbatim. The sequence-number field (bytes 4-5) is the
@@ -268,10 +353,14 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 
 	dc_iostream_purge (device->iostream, DC_DIRECTION_ALL);
 
-	// Best-effort EVA handshake. We can't validate the response content
-	// (its format isn't understood), so we only require that the I/O
-	// round-trip succeeds.
-	status = dc_iostream_write (device->iostream, suunto_nautic_eva_handshake, sizeof (suunto_nautic_eva_handshake), NULL);
+	// Best-effort EVA handshake, carrying this driver's own identity
+	// (see the comment above suunto_nautic_build_eva_handshake()). We
+	// can't validate the response content (its format isn't understood),
+	// so we only require that the I/O round-trip succeeds.
+	unsigned char eva_handshake[EVA_HANDSHAKE_SIZE];
+	suunto_nautic_build_eva_handshake (eva_handshake);
+
+	status = dc_iostream_write (device->iostream, eva_handshake, sizeof (eva_handshake), NULL);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to send the EVA handshake.");
 		goto error_close;

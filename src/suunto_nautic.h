@@ -95,6 +95,34 @@
  *     per the issue's documented offsets) is also implemented, but
  *     that reference dive doesn't contain a 0x0B chunk, so it's coded
  *     to spec rather than independently verified against real bytes.
+ *     Chunk 0x17 (surface pressure — SurfacePressure/MaxSurfacePressure/
+ *     MinSurfacePressure as 3 Float32 Pa values) is also decoded, into
+ *     DC_FIELD_ATMOSPHERIC — confirmed against a real captured chunk
+ *     matching the issue's own worked example to the decimal.
+ *   - Dive enumeration: suunto_nautic_device_foreach() requests
+ *     /Logbook/Entries (a flat array of 4-byte little-endian UInt32
+ *     dive IDs), sorts the results newest-first (the endpoint's own
+ *     ordering isn't documented, so this is done client-side since
+ *     every ID is itself a UNIX timestamp — see below), and downloads
+ *     each one in turn, stopping at the first ID matching the stored
+ *     fingerprint. dc_device_foreach() therefore works end-to-end for
+ *     this family now, unlike what some downstream comments (Swift
+ *     layer, NauticTestApp) still say — those predate this and need
+ *     updating to match, not the other way around.
+ *
+ *   - The "EVA" handshake (really the Whiteboard protocol's own Hello
+ *     message — see suunto_nautic_build_eva_handshake() in
+ *     suunto_nautic.c for the full derivation) now carries this
+ *     driver's own identity instead of replaying a phone's captured
+ *     one verbatim: decompiling the official Android app's libmds.so
+ *     showed the protocol-version and capability-flags bytes are fixed
+ *     build constants (confirmed byte-for-byte against the real
+ *     capture) and the sender-identity bytes follow a fully
+ *     reimplementable packing scheme with no cryptographic tie to a
+ *     specific phone. Two small regions of the payload are still
+ *     replayed as literal constants because they aren't understood
+ *     (see that function's comment) — this is closer to derived than
+ *     replayed, but still unverified against real hardware.
  *
  * A later issue update confirmed several things independently derived
  * above, and clarified two more:
@@ -122,17 +150,14 @@
  *     primary stop condition; that check is now a secondary one).
  *
  * What is NOT understood/implemented:
- *   - The "EVA" authentication handshake is replayed verbatim from a
- *     single captured session; whether it is universal or session/
- *     device-specific is unknown.
  *   - The non-sequence-number portion of the "Stream Fetch" trigger
  *     frames (see above) is still a verbatim replay, not derived.
- *   - The response format of /Logbook/Entries and
- *     /Logbook/UnsynchronisedLogs (needed to enumerate real dive IDs)
- *     has no known sample and is not parsed.
- *   - Most SBEM chunk IDs beyond 0x12/0x16/0x0B. The issue's chunk
+ *   - The response format of /Logbook/UnsynchronisedLogs (a *different*
+ *     endpoint from /Logbook/Entries, which is now understood and used
+ *     — see above) has no known sample and is not parsed.
+ *   - Most SBEM chunk IDs beyond 0x12/0x16/0x0B/0x17. The issue's chunk
  *     dictionary also names 0x08 (activity), 0x0E (satellites), 0x14
- *     (battery), 0x17 (surface pressure) with exact byte offsets, and
+ *     (battery) with exact byte offsets, and
  *     0x1A/0x1B/0x1C/0x1E (dive events: laps, alarms, gas switches,
  *     notifications) and 0x23/0x24 (high-frequency IMU) more
  *     qualitatively, without exact offsets. None of these are wired
@@ -147,8 +172,8 @@
  *     lookups, not extractable without full manual decompilation.
  *   - No chunk in the decoded stream carries a wall-clock timestamp --
  *     but a later report clarified it doesn't need to: the dive start
- *     time IS the dive ID itself. /Logbook/Entries (still unparsed,
- *     see above) returns an array of 4-byte little-endian UInt32,
+ *     time IS the dive ID itself. /Logbook/Entries (now parsed, see
+ *     above) returns an array of 4-byte little-endian UInt32,
  *     each one a standard UNIX timestamp, used as-is for the
  *     logbook_id argument to suunto_nautic_device_download() -- so the
  *     caller already has this value before download() is ever called.
@@ -175,23 +200,23 @@
  * confirmation that the decode is producing the right kind of data.
  *
  * Practical implication: this driver can connect, authenticate
- * (best-effort), download, and decode a *known* logbook entry ID via
- * suunto_nautic_device_download() + suunto_nautic_parser_create() into
- * a real depth/temperature/tank-pressure profile. It cannot yet
- * enumerate which IDs exist on a given watch (though, per above, the
- * caller already has the dive's timestamp the moment it has that ID),
- * and does not yet decode dive events or the other chunk IDs named
- * above.
+ * (best-effort), enumerate real dives via dc_device_foreach(), and
+ * download + decode each one via suunto_nautic_device_download() +
+ * suunto_nautic_parser_create() into a real depth/temperature/tank-
+ * pressure/atmospheric-pressure profile. It does not yet decode dive
+ * events or the other chunk IDs named above, and dc_parser_get_datetime()
+ * is unsupported (see above for why that's lower-impact than it sounds).
  *
  * Robustness note: Heatshrink decompression can leave localized
  * artifacts in the decoded stream (observed as runs of a single
  * repeated byte), which a naive linear TLV walk would misread as a
  * chunk header and permanently desync every chunk after it.
  * suunto_nautic_sbem_next() (suunto_nautic_parser.c) guards against
- * this for the two chunk IDs with a confirmed fixed length (0x0B = 20
- * bytes, 0x16 = 195 bytes): a length mismatch means the candidate
- * header is an artifact, and the parser resynchronizes by scanning
- * forward one byte at a time instead of trusting it.
+ * this for every chunk ID with a confirmed fixed length (0x08 = 6,
+ * 0x0B = 20, 0x0E = 6, 0x14 = 7, 0x16 = 195, 0x17 = 14 bytes): a length
+ * mismatch means the candidate header is an artifact, and the parser
+ * resynchronizes by scanning forward one byte at a time instead of
+ * trusting it.
  */
 
 #ifndef SUUNTO_NAUTIC_H
