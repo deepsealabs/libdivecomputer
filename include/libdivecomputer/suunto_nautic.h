@@ -59,6 +59,21 @@ dc_status_t
 suunto_nautic_device_request (dc_device_t *device, const char *path, dc_buffer_t *response);
 
 /*
+ * Fetch the full payload of an RPC endpoint whose response doesn't fit
+ * in a single ACK (e.g. "/Logbook/Entries",
+ * "/Logbook/UnsynchronisedLogs"). Unlike suunto_nautic_device_request(),
+ * which only performs the GET and returns the ACK, this runs the full
+ * GET -> ACK(watch magic) -> FETCH1 -> FETCH2 -> stream-collect sequence
+ * and returns the concatenated, MDS-chunk-stripped payload. The bytes
+ * are NOT decompressed (callers that need Heatshrink decompression, like
+ * dive data, should use suunto_nautic_device_download()); endpoints that
+ * return an uncompressed array (the logbook listings) can use the result
+ * directly.
+ */
+dc_status_t
+suunto_nautic_device_fetch (dc_device_t *device, const char *path, dc_buffer_t *response);
+
+/*
  * Download and decompress a specific logbook entry, given its numeric
  * id as it appears in a "/Logbook/byId/<id>/..." path (e.g.
  * "1787752091"). On success, `raw` holds the decoded SBEM0103 TLV

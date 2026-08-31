@@ -631,6 +631,16 @@ suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_b
 }
 
 dc_status_t
+suunto_nautic_device_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_buffer_clear (response);
+	return suunto_nautic_device_stream_fetch (abstract, path, response);
+}
+
+dc_status_t
 suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *raw)
 {
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || raw == NULL)
