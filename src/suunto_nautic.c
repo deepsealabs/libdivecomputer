@@ -36,13 +36,33 @@
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
+#define RPC_OP_FETCH         0x0D
 #define RPC_OP_STREAM_FETCH2 0x10
+#define RPC_OP_DATA          0x05
 
 #define RPC_HEADER_SIZE 10 // magic(1) + opcode(1) + sublen(2) + seq(2) + 0x01 + 0x80 + 0x00 + pathlen(1)
 #define RPC_CRC_SIZE     4
 
+// Offset of the 3-byte session handle inside an ACK (0x02) or DATA (0x05)
+// frame: magic(1) + opcode(1) + sublen(2) + msgid(2).
+#define RPC_HANDLE_OFFSET 6
+// Offset of the 16-bit LE HTTP-like status inside a DATA (0x05) frame:
+// magic(1) + opcode(1) + sublen(2) + msgid(2) + handle(3) + flags(3).
+#define RPC_STATUS_OFFSET 12
+#define RPC_STATUS_OK     200
+
 #define MAX_PATH    240
 #define MAX_PACKET  512
+
+// Dive IDs are UNIX timestamps. /Logbook/Entries returns them as 4-byte-
+// aligned little-endian uint32 values embedded in a small SBEM payload
+// alongside handle/flag/count/CRC fields; filtering to a plausible
+// timestamp window (2017-07 .. 2036-07) cleanly isolates the IDs, which is
+// how the reference client extracts them too. Must scan 4-aligned: the IDs
+// are packed adjacently, so an unaligned read straddling two of them can
+// land inside the same window and invent a phantom dive.
+#define DIVE_ID_MIN 1500000000u
+#define DIVE_ID_MAX 2100000000u
 
 // Number of PMT-style chunks to accept before giving up. This is a safety
 // cap, not a protocol constant — the real termination condition (how the
@@ -288,6 +308,39 @@ suunto_nautic_build_stream_fetch (unsigned char packet[], unsigned int size, uns
 
 	unsigned int crc = checksum_crc32r (packet, 6 + tail_size);
 	array_uint32_le_set (packet + 6 + tail_size, crc);
+
+	*out_len = len;
+	return DC_STATUS_SUCCESS;
+}
+
+// Build the "short" fetch (opcode 0x0D) the official app uses to read a
+// small whole resource in one shot, e.g. /Logbook/Entries. Payload is
+// [seq:2 LE][handle:3][01 80 00 00] -- the trailing 01 80 00 00 is the
+// no-range form. This is deliberately NOT the ranged fetch used for large
+// paginated resources (Summary/Data), whose payload ends 01 80 00 01 06 00
+// [offset:4]; sending that ranged form to /Logbook/Entries makes the watch
+// reject it with a 400 Bad Request (verified against a real device and the
+// official-app capture, issue #29).
+static dc_status_t
+suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
+	unsigned int seq, const unsigned char handle[3])
+{
+	static const unsigned char tail[] = { 0x01, 0x80, 0x00, 0x00 };
+	unsigned int payload = 3 + (unsigned int) sizeof (tail); // handle(3) + tail
+	unsigned int len = 4 + 2 + payload + RPC_CRC_SIZE;        // magic+opcode+sublen(4) + seq(2) + payload + crc
+	if (len > size)
+		return DC_STATUS_INVALIDARGS;
+
+	packet[0] = 0xA5;
+	packet[1] = RPC_OP_FETCH;
+	// sublen counts seq(2)+payload minus 2, i.e. payload itself.
+	array_uint16_le_set (packet + 2, (unsigned short) payload);
+	array_uint16_le_set (packet + 4, (unsigned short) seq);
+	memcpy (packet + 6, handle, 3);
+	memcpy (packet + 9, tail, sizeof (tail));
+
+	unsigned int crc = checksum_crc32r (packet, 6 + payload);
+	array_uint32_le_set (packet + 6 + payload, crc);
 
 	*out_len = len;
 	return DC_STATUS_SUCCESS;
@@ -630,14 +683,99 @@ suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_b
 	return DC_STATUS_SUCCESS;
 }
 
+// Fetch a small whole resource (e.g. /Logbook/Entries) using the official
+// app's GET -> ACK(handle) -> SHORT-FETCH(0x0D) -> DATA(0x05) flow. Unlike
+// suunto_nautic_device_stream_fetch()'s 0x0B/0x10 triggers (which the watch
+// answers for the listing endpoints with control frames carrying no data),
+// this uses the no-range 0x0D fetch the watch actually serves the listing
+// with. `response` receives the raw DATA-frame content (the bytes after the
+// A5 05 sublen header, including the 10-byte REST sub-header and trailing
+// CRC), matching the layout the reference client parses. Assumes the whole
+// resource fits in one DATA frame -- true for a normal logbook; a status of
+// 100 (more pages) is surfaced as a warning rather than silently truncating.
+static dc_status_t
+suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	// 1. GET the resource; the ACK carries the 3-byte session handle.
+	dc_buffer_t *ack = dc_buffer_new (0);
+	if (ack == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	status = suunto_nautic_device_request (abstract, path, ack);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (ack);
+		ERROR (abstract->context, "Failed to request %s.", path);
+		return status;
+	}
+
+	const unsigned char *ack_data = dc_buffer_get_data (ack);
+	size_t ack_size = dc_buffer_get_size (ack);
+	if (ack_size < RPC_HANDLE_OFFSET + 3) {
+		dc_buffer_free (ack);
+		ERROR (abstract->context, "ACK too short for a handle (" DC_PRINTF_SIZE ").", ack_size);
+		return DC_STATUS_DATAFORMAT;
+	}
+	unsigned char handle[3];
+	memcpy (handle, ack_data + RPC_HANDLE_OFFSET, sizeof (handle));
+	dc_buffer_free (ack);
+
+	// 2. SHORT fetch (no range header) reads the whole small resource.
+	unsigned char fetch[32];
+	unsigned int fetch_len = 0;
+	status = suunto_nautic_build_short_fetch (fetch, sizeof (fetch), &fetch_len, device->sequence, handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+	device->sequence++;
+
+	status = dc_iostream_write (device->iostream, fetch, fetch_len, NULL);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to send the short fetch for %s.", path);
+		return status;
+	}
+
+	// 3. Read the single DATA (0x05) frame.
+	unsigned char packet[MAX_PACKET] = {0};
+	size_t len = 0;
+	status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to receive the data for %s.", path);
+		return status;
+	}
+
+	HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "FETCH RSP", packet, len);
+
+	if (len < RPC_STATUS_OFFSET + 2 || packet[0] != 0xA5 || packet[1] != RPC_OP_DATA) {
+		ERROR (abstract->context, "Unexpected data frame for %s (" DC_PRINTF_SIZE " bytes).", path, len);
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
+	if (frame_status != RPC_STATUS_OK) {
+		ERROR (abstract->context, "Watch returned status %u for %s (200 expected).", frame_status, path);
+		return DC_STATUS_PROTOCOL;
+	}
+
+	// Return the frame content (everything after A5 05 sublen), matching what
+	// the reference client parses for the entries listing.
+	dc_buffer_clear (response);
+	if (!dc_buffer_append (response, packet + 4, len - 4)) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		return DC_STATUS_NOMEMORY;
+	}
+
+	return DC_STATUS_SUCCESS;
+}
+
 dc_status_t
 suunto_nautic_device_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
 {
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
 		return DC_STATUS_INVALIDARGS;
 
-	dc_buffer_clear (response);
-	return suunto_nautic_device_stream_fetch (abstract, path, response);
+	return suunto_nautic_device_short_fetch (abstract, path, response);
 }
 
 dc_status_t
@@ -720,15 +858,18 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	progress.current = 1;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	// /Logbook/Entries returns a flat array of 4-byte little-endian
-	// UInt32 dive IDs -- each one is also a UNIX timestamp (the dive
-	// start time; see suunto_nautic_parser.c's file header for why no
-	// chunk in the decoded profile carries one).
+	// /Logbook/Entries returns a small SBEM payload embedding each dive's
+	// LogId (a UNIX timestamp) as a 4-aligned little-endian uint32,
+	// alongside handle/flag/count/CRC fields. The IDs are isolated by a
+	// timestamp-window filter (see DIVE_ID_MIN/MAX); this is the endpoint's
+	// documented behaviour, not a flat ID array as an earlier version of
+	// this driver assumed. Uses the short 0x0D fetch -- the watch rejects
+	// the ranged stream-fetch (used for dive data) for this endpoint.
 	dc_buffer_t *entries = dc_buffer_new (0);
 	if (entries == NULL)
 		return DC_STATUS_NOMEMORY;
 
-	status = suunto_nautic_device_stream_fetch (abstract, "/Logbook/Entries", entries);
+	status = suunto_nautic_device_short_fetch (abstract, "/Logbook/Entries", entries);
 	if (status != DC_STATUS_SUCCESS) {
 		dc_buffer_free (entries);
 		ERROR (abstract->context, "Failed to fetch /Logbook/Entries.");
@@ -737,21 +878,21 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 
 	const unsigned char *entries_data = dc_buffer_get_data (entries);
 	size_t entries_size = dc_buffer_get_size (entries);
-	if (entries_size % 4 != 0) {
-		WARNING (abstract->context, "Unexpected /Logbook/Entries size (" DC_PRINTF_SIZE "), truncating to a multiple of 4.", entries_size);
-		entries_size -= entries_size % 4;
-	}
-	unsigned int count = (unsigned int) (entries_size / 4);
 
+	unsigned int count = 0;
 	unsigned int *ids = NULL;
-	if (count > 0) {
-		ids = (unsigned int *) malloc (count * sizeof (unsigned int));
+	if (entries_size >= 4) {
+		// At most one id per 4 bytes.
+		ids = (unsigned int *) malloc ((entries_size / 4) * sizeof (unsigned int));
 		if (ids == NULL) {
 			dc_buffer_free (entries);
 			return DC_STATUS_NOMEMORY;
 		}
-		for (unsigned int i = 0; i < count; i++)
-			ids[i] = array_uint32_le (entries_data + i * 4);
+		for (size_t i = 0; i + 4 <= entries_size; i += 4) {
+			unsigned int v = array_uint32_le (entries_data + i);
+			if (v >= DIVE_ID_MIN && v <= DIVE_ID_MAX)
+				ids[count++] = v;
+		}
 	}
 	dc_buffer_free (entries);
 
