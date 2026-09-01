@@ -525,13 +525,20 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 		} else if ((chunk.id == CHUNK_EVENT_ALARM || chunk.id == CHUNK_EVENT_WARNING ||
 				chunk.id == CHUNK_EVENT_NOTIFY || chunk.id == CHUNK_EVENT_STATE) && chunk.size >= 4) {
 			// [timeDelta:2][Type:1][Active:1]; Active 1=begin, 0=end.
+			// The libdivecomputer event vocabulary can't express Suunto's full
+			// set (e.g. "Safety Stop Ahead" vs "At Safety Stop" both map to
+			// SAFETYSTOP), so alongside the mapped type we pass the native
+			// (subgroup, type) through event.value as (chunk_id << 8 | type).
+			// Consumers that want the exact Suunto label decode it from there;
+			// standard consumers use event.type as usual. (Gas switch keeps
+			// event.value as the gas number, per libdivecomputer convention.)
 			if (callback) {
 				dc_sample_value_t sample = {0};
 				sample.time = (unsigned int) time_ms;
 				callback (DC_SAMPLE_TIME, &sample, userdata);
 				sample.event.type = suunto_nautic_map_event (chunk.id, chunk.data[2]);
 				sample.event.flags = chunk.data[3] ? SAMPLE_FLAGS_BEGIN : SAMPLE_FLAGS_END;
-				sample.event.value = 0;
+				sample.event.value = (chunk.id << 8) | chunk.data[2];
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_GAS_SWITCH && chunk.size >= 4) {

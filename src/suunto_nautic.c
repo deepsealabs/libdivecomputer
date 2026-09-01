@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-events-datetime"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-labels-dedup"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -68,10 +68,10 @@
 #define DIVE_ID_MIN 1500000000u
 #define DIVE_ID_MAX 2100000000u
 
-// Entry count in the /Logbook/Entries response, a little-endian uint32 at
-// this offset into the returned frame content (10-byte REST sub-header +
-// SBEM offset 6). Used to cap ID extraction before the SBEM tail bytes.
-#define ENTRIES_COUNT_OFFSET 16
+// Each entry stores start then end timestamp adjacently; an end is always
+// within a day of its start. Used to pair (start, end) so a dive's end isn't
+// listed as a second dive.
+#define DIVE_ENTRY_MAX_PAIR_GAP 86400u
 
 // Number of PMT-style chunks to accept before giving up. This is a safety
 // cap, not a protocol constant — the real termination condition (how the
@@ -1021,27 +1021,30 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	unsigned int count = 0;
 	unsigned int *ids = NULL;
 	if (entries_size >= 4) {
-		// Cap extraction at the SBEM entry count. The payload ends with a
-		// per-request rolling token that can itself fall in the dive-ID
-		// window; stopping after `expected` values keeps that tail from
-		// being misread as a phantom entry.
+		// Each entry stores its start timestamp (the LogId) immediately
+		// followed by the dive's end timestamp, both 4-aligned uint32s in the
+		// dive-ID window. Take only the starts: when an in-range value is
+		// immediately followed by a larger in-range value within a day, that
+		// is one entry's (start, end) pair, so take the start and skip the
+		// end. Otherwise a single dive lists as two (its end looks like a
+		// second dive id). Bytes between entries fall outside the window.
 		size_t max_ids = entries_size / 4; // at most one id per 4 bytes
-		unsigned int expected = (unsigned int) max_ids;
-		if (entries_size >= ENTRIES_COUNT_OFFSET + 4) {
-			unsigned int n = array_uint32_le (entries_data + ENTRIES_COUNT_OFFSET);
-			if (n <= max_ids)
-				expected = n;
-		}
-
 		ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
 		if (ids == NULL) {
 			dc_buffer_free (entries);
 			return DC_STATUS_NOMEMORY;
 		}
-		for (size_t i = 0; i + 4 <= entries_size && count < expected; i += 4) {
+		for (size_t i = 0; i + 4 <= entries_size; i += 4) {
 			unsigned int v = array_uint32_le (entries_data + i);
-			if (v >= DIVE_ID_MIN && v <= DIVE_ID_MAX)
-				ids[count++] = v;
+			if (v < DIVE_ID_MIN || v > DIVE_ID_MAX)
+				continue;
+			ids[count++] = v;
+			if (i + 8 <= entries_size) {
+				unsigned int next = array_uint32_le (entries_data + i + 4);
+				if (next >= DIVE_ID_MIN && next <= DIVE_ID_MAX &&
+						next > v && next - v <= DIVE_ENTRY_MAX_PAIR_GAP)
+					i += 4; // skip this entry's paired end timestamp
+			}
 		}
 	}
 	dc_buffer_free (entries);
