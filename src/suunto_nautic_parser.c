@@ -89,13 +89,19 @@
 #define CHUNK_TIMELINE_BASE   0x01
 #define CHUNK_ACTIVITY        0x08
 #define CHUNK_GPS             0x0B
-#define CHUNK_GPS_SATELLITES  0x0E // [timeDelta:2][dEHPE:int8][dEVPE:int8][?:2]
-// Battery telemetry. [timeDelta:2][current:int16][voltage:uint16 LE mV][charge:uint8 %].
-// Emitted as DC_SAMPLE_VENDOR (SAMPLE_VENDOR_SUUNTO_NAUTIC) since libdivecomputer
-// has no dedicated battery sample; payload is a canonical little-endian record
-// (see the handler below).
-#define CHUNK_BATTERY         0x14
-#define VENDOR_BATTERY_VERSION 1 // payload layout tag (byte 0 of the vendor record)
+#define CHUNK_GPS_ACCURACY    0x0E // [timeDelta:2][dEHPE:int8][dEVPE:int8][?:2]
+#define CHUNK_BATTERY         0x14 // [timeDelta:2][current:int16][voltage:uint16 mV][charge:uint8 %]
+#define CHUNK_IMU             0x23 // [timeDelta:2][algoTS:uint32][accel/gyro/mag X,Y,Z:int16]
+#define CHUNK_DIVEROUTE       0x24 // [timeDelta:2][algoTS:uint32][5x uint16 route features]
+
+// libdivecomputer has no dedicated battery/GPS-accuracy/IMU sample types, so
+// these are delivered through the generic DC_SAMPLE_VENDOR channel tagged
+// SAMPLE_VENDOR_SUUNTO_NAUTIC. Byte 0 of every vendor record is one of these
+// kinds; the rest is a canonical little-endian payload (see each handler).
+#define VENDOR_KIND_BATTERY      1 // [voltage_mv:u16][charge_permille:u16]
+#define VENDOR_KIND_GPS_ACCURACY 2 // [ehpe_m:u16][evpe_m:u16]
+#define VENDOR_KIND_IMU          3 // [ax,ay,az,gx,gy,gz,mx,my,mz:int16]
+#define VENDOR_KIND_DIVEROUTE    4 // [f0,f1,f2,f3,f4:uint16]
 #define CHUNK_PROFILE_1HZ     0x12
 #define CHUNK_EXTENDED_STATUS 0x16
 #define CHUNK_SURFACE_PRESSURE 0x17
@@ -213,7 +219,7 @@ suunto_nautic_sbem_fixed_length (unsigned int id)
 	switch (id) {
 	case CHUNK_ACTIVITY:         return 6;
 	case CHUNK_GPS:              return 20;
-	case CHUNK_GPS_SATELLITES:   return 6;
+	case CHUNK_GPS_ACCURACY:     return 6;
 	case CHUNK_BATTERY:          return 7;
 	case CHUNK_EXTENDED_STATUS:  return 195;
 	case CHUNK_SURFACE_PRESSURE: return 14;
@@ -359,6 +365,22 @@ suunto_nautic_map_event (unsigned int chunk_id, unsigned int type)
 	}
 }
 
+// Emit a Suunto-Nautic vendor record at the given sample time. Every such
+// record starts with a VENDOR_KIND_* byte so a single vendor type can carry
+// several kinds of non-standard telemetry (battery, GPS accuracy, IMU, ...).
+static void
+suunto_nautic_emit_vendor (dc_sample_callback_t callback, void *userdata,
+	int time_ms, const unsigned char *rec, unsigned int size)
+{
+	dc_sample_value_t sample = {0};
+	sample.time = (unsigned int) time_ms;
+	callback (DC_SAMPLE_TIME, &sample, userdata);
+	sample.vendor.type = SAMPLE_VENDOR_SUUNTO_NAUTIC;
+	sample.vendor.size = size;
+	sample.vendor.data = rec;
+	callback (DC_SAMPLE_VENDOR, &sample, userdata);
+}
+
 static dc_status_t
 suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata)
 {
@@ -409,6 +431,9 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	double atmospheric = 0.0;
 
 	unsigned int have_datetime = 0;
+
+	// GPS horizontal/vertical position error, int8-delta-accumulated (chunk 0x0E).
+	int ehpe = 0, evpe = 0;
 
 	sbem_chunk_t chunk;
 	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) profile_size, &offset, &chunk)) {
@@ -558,28 +583,51 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_BATTERY && chunk.size >= 7) {
-			// Battery telemetry -> DC_SAMPLE_VENDOR. The payload is a canonical
-			// little-endian record so consumers don't need to know the chunk
-			// layout: [version:1][voltage_mv:uint16][charge_permille:uint16].
+			// Battery telemetry -> DC_SAMPLE_VENDOR kind 1.
 			// (Current at chunk.data+2 is int16 but its scale isn't confirmed,
 			// so it's left out for now.)
 			if (callback) {
 				unsigned int voltage_mv = array_uint16_le (chunk.data + 4);
 				unsigned int charge_permille = chunk.data[6] * 10; // % -> permille
 				unsigned char rec[5];
-				rec[0] = VENDOR_BATTERY_VERSION;
+				rec[0] = VENDOR_KIND_BATTERY;
 				rec[1] = voltage_mv & 0xFF;
 				rec[2] = (voltage_mv >> 8) & 0xFF;
 				rec[3] = charge_permille & 0xFF;
 				rec[4] = (charge_permille >> 8) & 0xFF;
-
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				sample.vendor.type = SAMPLE_VENDOR_SUUNTO_NAUTIC;
-				sample.vendor.size = sizeof (rec);
-				sample.vendor.data = rec;
-				callback (DC_SAMPLE_VENDOR, &sample, userdata);
+				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
+			}
+		} else if (chunk.id == CHUNK_GPS_ACCURACY && chunk.size >= 4) {
+			// EHPE/EVPE are int8 deltas accumulated from zero -> DC_SAMPLE_VENDOR
+			// kind 2, absolute metres.
+			ehpe += (int8_t) chunk.data[2];
+			evpe += (int8_t) chunk.data[3];
+			if (ehpe < 0) ehpe = 0;
+			if (evpe < 0) evpe = 0;
+			if (callback) {
+				unsigned int e = (unsigned int) ehpe, v = (unsigned int) evpe;
+				unsigned char rec[5];
+				rec[0] = VENDOR_KIND_GPS_ACCURACY;
+				rec[1] = e & 0xFF; rec[2] = (e >> 8) & 0xFF;
+				rec[3] = v & 0xFF; rec[4] = (v >> 8) & 0xFF;
+				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
+			}
+		} else if (chunk.id == CHUNK_IMU && chunk.size >= 24) {
+			// 9x int16 (accel/gyro/mag X,Y,Z) at offset 6, already little-endian
+			// -> DC_SAMPLE_VENDOR kind 3, passed through verbatim.
+			if (callback) {
+				unsigned char rec[1 + 18];
+				rec[0] = VENDOR_KIND_IMU;
+				memcpy (rec + 1, chunk.data + 6, 18);
+				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
+			}
+		} else if (chunk.id == CHUNK_DIVEROUTE && chunk.size >= 16) {
+			// 5x uint16 route features at offset 6 -> DC_SAMPLE_VENDOR kind 4.
+			if (callback) {
+				unsigned char rec[1 + 10];
+				rec[0] = VENDOR_KIND_DIVEROUTE;
+				memcpy (rec + 1, chunk.data + 6, 10);
+				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
 			}
 		} else if (chunk.id == CHUNK_SURFACE_PRESSURE && chunk.size >= 6) {
 			// 3 Float32 values at offset 2/6/10 (SurfacePressure,

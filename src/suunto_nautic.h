@@ -197,6 +197,10 @@
  * pressure/atmospheric-pressure/GPS profile with dive events (alarms,
  * warnings, notifications, state changes, gas switches), the correct
  * delta-encoded sample times and dive time, and the dive datetime.
+ * Non-standard series that libdivecomputer has no sample type for --
+ * battery (voltage/charge), GPS accuracy (EHPE/EVPE), the 9-axis IMU, and
+ * dive-route features -- are delivered through DC_SAMPLE_VENDOR tagged
+ * SAMPLE_VENDOR_SUUNTO_NAUTIC, each record led by a VENDOR_KIND_* byte.
  * dc_parser_get_datetime() derives the start time from the stream's only
  * absolute clock: each GPS fix (chunk 0x0B) carries an absolute UTC in
  * milliseconds, so start = gps_utc - gps_relative_time. That reconstructs
