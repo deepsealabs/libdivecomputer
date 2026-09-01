@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-raw-diag"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-fetch-robust"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -808,7 +808,7 @@ suunto_nautic_device_paginated_fetch (dc_device_t *abstract, const char *path, d
 // raw diagnostic (suunto_nautic_device_fetch_raw) returns the frame as-is so a
 // tester can export whatever the watch actually sent when parsing fails.
 static dc_status_t
-suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buffer_t *frame)
+suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buffer_t *frame, int skip_non_data)
 {
 	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
 	dc_status_t status = DC_STATUS_SUCCESS;
@@ -850,16 +850,32 @@ suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buf
 		return status;
 	}
 
-	// 3. Read the single response frame (raw, unvalidated).
+	// 3. Read the response frame. The watch occasionally injects an
+	// unsolicited Hello frame (op 0x12/0x13) mid-session, and a single blind
+	// read can grab that instead of the DATA frame -- an intermittent
+	// DC_STATUS_DATAFORMAT. When skip_non_data is set, skip frames that aren't
+	// a DATA (0x05) frame until the real one arrives (bounded). The raw
+	// diagnostic passes 0 and returns the very first frame, whatever it is.
 	unsigned char packet[MAX_PACKET] = {0};
 	size_t len = 0;
-	status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to receive the data for %s.", path);
-		return status;
-	}
-
-	HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "FETCH RSP", packet, len);
+	unsigned int attempts = 0;
+	const unsigned int max_attempts = 8;
+	do {
+		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to receive the data for %s.", path);
+			return status;
+		}
+		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "FETCH RSP", packet, len);
+		if (!skip_non_data)
+			break;
+		// Accept a well-formed DATA frame; skip anything else (Hello, a stale
+		// ACK, etc.) and read again.
+		if (len >= 2 && packet[0] == 0xA5 && packet[1] == RPC_OP_DATA)
+			break;
+		WARNING (abstract->context, "Skipping unexpected frame while fetching %s (op 0x%02x).",
+			path, len >= 2 ? packet[1] : 0);
+	} while (++attempts < max_attempts);
 
 	dc_buffer_clear (frame);
 	if (!dc_buffer_append (frame, packet, len)) {
@@ -877,7 +893,7 @@ suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_bu
 	if (frame == NULL)
 		return DC_STATUS_NOMEMORY;
 
-	dc_status_t status = suunto_nautic_short_fetch_frame (abstract, path, frame);
+	dc_status_t status = suunto_nautic_short_fetch_frame (abstract, path, frame, 1);
 	if (status != DC_STATUS_SUCCESS) {
 		dc_buffer_free (frame);
 		return status;
@@ -930,7 +946,7 @@ suunto_nautic_device_fetch_raw (dc_device_t *abstract, const char *path, dc_buff
 	// it to be a well-formed DATA (0x05) frame. Used to export the actual bytes
 	// when a normal fetch fails (e.g. /Logbook/Entries returning DATAFORMAT), so
 	// unknown per-device response formats can be reverse-engineered.
-	return suunto_nautic_short_fetch_frame (abstract, path, response);
+	return suunto_nautic_short_fetch_frame (abstract, path, response, 0);
 }
 
 dc_status_t
