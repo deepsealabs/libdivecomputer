@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-fetch-robust"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-fetch-handle"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -869,12 +869,18 @@ suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buf
 		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "FETCH RSP", packet, len);
 		if (!skip_non_data)
 			break;
-		// Accept a well-formed DATA frame; skip anything else (Hello, a stale
-		// ACK, etc.) and read again.
-		if (len >= 2 && packet[0] == 0xA5 && packet[1] == RPC_OP_DATA)
+		// Accept only a DATA (0x05) frame whose 3-byte handle matches the one
+		// this fetch was issued against. The watch interleaves unsolicited
+		// frames (a re-sent Hello, or an analytics/event stream on a different
+		// handle), and a blind read would grab those -- surfacing as an
+		// intermittent DC_STATUS_DATAFORMAT or, worse, the wrong resource's
+		// bytes. Skip anything that isn't our DATA frame and read again.
+		if (len >= RPC_HANDLE_OFFSET + 3 && packet[0] == 0xA5 && packet[1] == RPC_OP_DATA &&
+				memcmp (packet + RPC_HANDLE_OFFSET, handle, sizeof (handle)) == 0)
 			break;
-		WARNING (abstract->context, "Skipping unexpected frame while fetching %s (op 0x%02x).",
-			path, len >= 2 ? packet[1] : 0);
+		WARNING (abstract->context, "Skipping unexpected frame while fetching %s (op 0x%02x handle %s).",
+			path, len >= 2 ? packet[1] : 0,
+			len >= RPC_HANDLE_OFFSET + 3 ? "mismatch" : "short");
 	} while (++attempts < max_attempts);
 
 	dc_buffer_clear (frame);
