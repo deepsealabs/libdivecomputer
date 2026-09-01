@@ -95,6 +95,15 @@
 #define CHUNK_SURFACE_PRESSURE 0x17
 
 #define MAX_TANKS 8
+#define MAX_GASMIXES 4
+
+// Field offsets within the /Summary SBEM0103 section (relative to its
+// "SBEM0103" signature), confirmed against real hardware. The dive profile
+// (/Data) carries samples but not these; the driver appends the /Summary
+// SBEM after the profile so this parser can expose them the standard way.
+#define SUMMARY_GF_LOW   0x33 // uint16 LE, %
+#define SUMMARY_GF_HIGH  0x35 // uint16 LE, %
+#define SUMMARY_GAS_BASE 0xC7 // first gas; 4 bytes each: id, O2%, He%, type
 
 typedef struct suunto_nautic_tank_t {
 	unsigned int used;
@@ -117,6 +126,11 @@ typedef struct suunto_nautic_parser_t {
 	dc_location_t location;
 	unsigned int have_atmospheric;
 	double atmospheric; // bar
+	// From the /Summary SBEM section appended after the profile, if present.
+	unsigned int ngasmixes;
+	dc_gasmix_t gasmix[MAX_GASMIXES];
+	unsigned int have_decomodel;
+	dc_decomodel_t decomodel;
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -229,6 +243,56 @@ suunto_nautic_sbem_next (const unsigned char data[], unsigned int size, unsigned
 	return 0;
 }
 
+// The driver appends the (uncompressed) /Summary SBEM after the profile,
+// so the combined buffer holds two "SBEM0103" sections. Return the offset
+// of the second one (the /Summary), or `size` when there's only the
+// profile. Bounds the profile chunk walk and locates the /Summary fields.
+static size_t
+suunto_nautic_find_summary (const unsigned char *data, size_t size)
+{
+	if (size < SBEM_MAGIC_SIZE)
+		return size;
+	for (size_t i = SBEM_MAGIC_SIZE; i + SBEM_MAGIC_SIZE <= size; i++) {
+		if (memcmp (data + i, "SBEM0103", SBEM_MAGIC_SIZE) == 0)
+			return i;
+	}
+	return size;
+}
+
+// Parse gradient factors and gas mixes from the /Summary section, whose
+// "SBEM0103" signature is at `sbem` (length `size`). Offsets are relative
+// to that signature (confirmed on real hardware). Gases are validated by
+// plausibility (O2 in 1..100, He in 0..100-O2) and counted until the first
+// implausible slot, since unused slots hold unrelated bytes.
+static void
+suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char *sbem, size_t size)
+{
+	if (size >= SUMMARY_GF_HIGH + 2) {
+		unsigned int low = array_uint16_le (sbem + SUMMARY_GF_LOW);
+		unsigned int high = array_uint16_le (sbem + SUMMARY_GF_HIGH);
+		parser->decomodel.type = DC_DECOMODEL_BUHLMANN;
+		parser->decomodel.conservatism = 0;
+		parser->decomodel.params.gf.low = low;
+		parser->decomodel.params.gf.high = high;
+		parser->have_decomodel = 1;
+	}
+
+	for (unsigned int i = 0; i < MAX_GASMIXES; i++) {
+		size_t base = SUMMARY_GAS_BASE + (size_t) i * 4;
+		if (base + 3 > size)
+			break;
+		unsigned int o2 = sbem[base + 1];
+		unsigned int he = sbem[base + 2];
+		if (o2 < 1 || o2 > 100 || he > 100 || o2 + he > 100)
+			break; // unused/implausible slot -- stop
+		parser->gasmix[parser->ngasmixes].oxygen = o2 / 100.0;
+		parser->gasmix[parser->ngasmixes].helium = he / 100.0;
+		parser->gasmix[parser->ngasmixes].nitrogen = 1.0 - (o2 + he) / 100.0;
+		parser->gasmix[parser->ngasmixes].usage = DC_USAGE_NONE;
+		parser->ngasmixes++;
+	}
+}
+
 static dc_status_t
 suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata)
 {
@@ -238,6 +302,11 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 		ERROR (abstract->context, "Unexpected magic in the SBEM stream.");
 		return DC_STATUS_DATAFORMAT;
 	}
+
+	// The profile (/Data) is the first SBEM section; an optional /Summary
+	// section (gradient factors, gas mix) is appended after it. Walk only
+	// the profile here; parse /Summary separately below.
+	size_t profile_size = suunto_nautic_find_summary (abstract->data, abstract->size);
 
 	unsigned int offset = SBEM_MAGIC_SIZE;
 	unsigned int time = 0; // synthetic, see file header comment
@@ -261,7 +330,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	double atmospheric = 0.0;
 
 	sbem_chunk_t chunk;
-	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) abstract->size, &offset, &chunk)) {
+	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) profile_size, &offset, &chunk)) {
 		if (chunk.id == CHUNK_PROFILE_1HZ && chunk.size >= 18) {
 			double temperature = array_uint16_le (chunk.data + 16) / 100.0 - 273.15;
 
@@ -382,6 +451,17 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->location = location;
 	parser->have_atmospheric = have_atmospheric;
 	parser->atmospheric = atmospheric;
+
+	// Gradient factors and gas mixes from the appended /Summary section.
+	parser->ngasmixes = 0;
+	parser->have_decomodel = 0;
+	memset (parser->gasmix, 0, sizeof (parser->gasmix));
+	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
+	if (profile_size < abstract->size) {
+		suunto_nautic_parse_summary (parser, abstract->data + profile_size,
+			abstract->size - profile_size);
+	}
+
 	parser->cached = 1;
 
 	return DC_STATUS_SUCCESS;
@@ -447,6 +527,19 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		if (!parser->have_atmospheric)
 			return DC_STATUS_UNSUPPORTED;
 		*((double *) value) = parser->atmospheric;
+		break;
+	case DC_FIELD_GASMIX_COUNT:
+		*((unsigned int *) value) = parser->ngasmixes;
+		break;
+	case DC_FIELD_GASMIX:
+		if (flags >= parser->ngasmixes)
+			return DC_STATUS_INVALIDARGS;
+		*((dc_gasmix_t *) value) = parser->gasmix[flags];
+		break;
+	case DC_FIELD_DECOMODEL:
+		if (!parser->have_decomodel)
+			return DC_STATUS_UNSUPPORTED;
+		*((dc_decomodel_t *) value) = parser->decomodel;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;

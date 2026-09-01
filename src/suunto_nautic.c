@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-summary-paginated-fetch"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-gf-gas-parser-fields"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -946,6 +946,22 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 
 	DEBUG (abstract->context, "Decompressed " DC_PRINTF_SIZE " bytes for logbook entry %s.",
 		dc_buffer_get_size (raw), logbook_id);
+
+	// Append the /Summary SBEM (gradient factors, gas mix) after the
+	// profile, so the parser can expose them via DC_FIELD_DECOMODEL /
+	// DC_FIELD_GASMIX -- these aren't in the profile stream. Best-effort:
+	// the profile alone is still a valid dive if this fails.
+	dc_buffer_t *summary = dc_buffer_new (0);
+	if (summary != NULL) {
+		if (suunto_nautic_device_download_summary (abstract, logbook_id, summary) == DC_STATUS_SUCCESS &&
+			dc_buffer_get_size (summary) > 0) {
+			if (!dc_buffer_append (raw, dc_buffer_get_data (summary), dc_buffer_get_size (summary)))
+				WARNING (abstract->context, "Failed to append the Summary; GF/gas will be unavailable.");
+		} else {
+			WARNING (abstract->context, "Failed to fetch the Summary for %s; GF/gas will be unavailable.", logbook_id);
+		}
+		dc_buffer_free (summary);
+	}
 
 	return DC_STATUS_SUCCESS;
 }
