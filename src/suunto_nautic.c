@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-entries-list"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-raw-diag"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -802,8 +802,13 @@ suunto_nautic_device_paginated_fetch (dc_device_t *abstract, const char *path, d
 // this no-range 0x0D form. `response` receives the raw DATA-frame content
 // (everything after the A5 05 sublen header). Assumes the resource fits in
 // one DATA frame, which holds for a normal logbook.
+// GET -> ACK(handle) -> 0x0D short fetch -> read one frame. Returns the RAW
+// frame bytes (the whole A5.. packet) in `frame`, with NO opcode validation.
+// suunto_nautic_device_short_fetch() validates and extracts the content; the
+// raw diagnostic (suunto_nautic_device_fetch_raw) returns the frame as-is so a
+// tester can export whatever the watch actually sent when parsing fails.
 static dc_status_t
-suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buffer_t *frame)
 {
 	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
 	dc_status_t status = DC_STATUS_SUCCESS;
@@ -845,7 +850,7 @@ suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_bu
 		return status;
 	}
 
-	// 3. Read the single DATA (0x05) frame.
+	// 3. Read the single response frame (raw, unvalidated).
 	unsigned char packet[MAX_PACKET] = {0};
 	size_t len = 0;
 	status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
@@ -856,20 +861,49 @@ suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_bu
 
 	HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "FETCH RSP", packet, len);
 
+	dc_buffer_clear (frame);
+	if (!dc_buffer_append (frame, packet, len)) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		return DC_STATUS_NOMEMORY;
+	}
+
+	return DC_STATUS_SUCCESS;
+}
+
+static dc_status_t
+suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	dc_buffer_t *frame = dc_buffer_new (0);
+	if (frame == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	dc_status_t status = suunto_nautic_short_fetch_frame (abstract, path, frame);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (frame);
+		return status;
+	}
+
+	const unsigned char *packet = dc_buffer_get_data (frame);
+	size_t len = dc_buffer_get_size (frame);
+
 	if (len < RPC_STATUS_OFFSET + 2 || packet[0] != 0xA5 || packet[1] != RPC_OP_DATA) {
 		ERROR (abstract->context, "Unexpected data frame for %s (" DC_PRINTF_SIZE " bytes).", path, len);
+		dc_buffer_free (frame);
 		return DC_STATUS_DATAFORMAT;
 	}
 
 	unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
 	if (frame_status != RPC_STATUS_OK) {
 		ERROR (abstract->context, "Watch returned status %u for %s (200 expected).", frame_status, path);
+		dc_buffer_free (frame);
 		return DC_STATUS_PROTOCOL;
 	}
 
 	// Return the frame content (everything after A5 05 sublen).
 	dc_buffer_clear (response);
-	if (!dc_buffer_append (response, packet + 4, len - 4)) {
+	int ok = dc_buffer_append (response, packet + 4, len - 4);
+	dc_buffer_free (frame);
+	if (!ok) {
 		ERROR (abstract->context, "Failed to allocate memory.");
 		return DC_STATUS_NOMEMORY;
 	}
@@ -884,6 +918,19 @@ suunto_nautic_device_fetch (dc_device_t *abstract, const char *path, dc_buffer_t
 		return DC_STATUS_INVALIDARGS;
 
 	return suunto_nautic_device_short_fetch (abstract, path, response);
+}
+
+dc_status_t
+suunto_nautic_device_fetch_raw (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	// Diagnostic: return the raw fetch frame the watch sends, without requiring
+	// it to be a well-formed DATA (0x05) frame. Used to export the actual bytes
+	// when a normal fetch fails (e.g. /Logbook/Entries returning DATAFORMAT), so
+	// unknown per-device response formats can be reverse-engineered.
+	return suunto_nautic_short_fetch_frame (abstract, path, response);
 }
 
 dc_status_t

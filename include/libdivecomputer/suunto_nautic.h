@@ -69,6 +69,17 @@ dc_status_t
 suunto_nautic_device_fetch (dc_device_t *device, const char *path, dc_buffer_t *response);
 
 /*
+ * Diagnostic variant of suunto_nautic_device_fetch(): runs the same
+ * GET -> ACK -> short fetch sequence but returns the RAW response frame
+ * (the whole A5.. packet) with no opcode/status validation. Intended for
+ * exporting the actual bytes when a normal fetch fails (e.g. /Logbook/Entries
+ * returning DC_STATUS_DATAFORMAT on a device whose response format isn't yet
+ * understood), so it can be reverse-engineered.
+ */
+dc_status_t
+suunto_nautic_device_fetch_raw (dc_device_t *device, const char *path, dc_buffer_t *response);
+
+/*
  * List dive ids (each is a UNIX-timestamp LogId), newest-first, without
  * downloading the dives. `ids` receives the ids packed as little-endian
  * uint32 (4 bytes each); read them back as a plain array. This is the cheap
