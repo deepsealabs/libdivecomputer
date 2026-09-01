@@ -69,6 +69,16 @@ dc_status_t
 suunto_nautic_device_fetch (dc_device_t *device, const char *path, dc_buffer_t *response);
 
 /*
+ * Download a dive's /Summary (metadata: gradient factors, gas mix, ...).
+ * Uses the paginated 0x0D fetch; `summary` receives the raw, uncompressed
+ * SBEM0103 payload. The caller locates the "SBEM0103" signature and reads
+ * fields at documented offsets from it (unlike the profile from
+ * suunto_nautic_device_download(), this is not Heatshrink-compressed).
+ */
+dc_status_t
+suunto_nautic_device_download_summary (dc_device_t *device, const char *logbook_id, dc_buffer_t *summary);
+
+/*
  * Download and decompress a specific logbook entry, given its numeric
  * id as it appears in a "/Logbook/byId/<id>/..." path (e.g.
  * "1787752091"). On success, `raw` holds the decoded SBEM0103 TLV

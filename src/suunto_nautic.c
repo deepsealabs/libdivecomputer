@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-entries-count-cap"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-summary-paginated-fetch"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -54,7 +54,8 @@
 // Offset of the 16-bit LE HTTP-like status inside a DATA (0x05) frame:
 // magic(1) + opcode(1) + sublen(2) + msgid(2) + handle(3) + flags(3).
 #define RPC_STATUS_OFFSET 12
-#define RPC_STATUS_OK     200
+#define RPC_STATUS_OK       200
+#define RPC_STATUS_CONTINUE 100 // more pages follow (paginated fetch)
 
 #define MAX_PATH    240
 #define MAX_PACKET  512
@@ -77,6 +78,9 @@
 // watch signals "no more chunks") is unknown, so we stop on the first read
 // timeout instead.
 #define MAX_CHUNKS 4096
+
+// Safety cap on paginated-fetch pages (a Summary is a handful of pages).
+#define MAX_PAGES 64
 
 // The Suunto "MDS" chunk header wrapping each compressed block. Verified
 // against a real capture (see suunto_nautic.h): the header is 28 bytes,
@@ -338,6 +342,36 @@ suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsi
 	array_uint16_le_set (packet + 4, (unsigned short) seq);
 	memcpy (packet + 6, handle, 3);
 	memcpy (packet + 9, tail, sizeof (tail));
+
+	unsigned int crc = checksum_crc32r (packet, 6 + payload);
+	array_uint32_le_set (packet + 6 + payload, crc);
+
+	*out_len = len;
+	return DC_STATUS_SUCCESS;
+}
+
+// Build a paginated fetch (opcode 0x0D) for a resource the watch returns
+// across multiple pages, e.g. /Logbook/byId/<id>/Summary. Payload is
+// [seq:2 LE][handle:3][01 80 00 01 06 00][offset:4 LE] -- the ranged form.
+// The watch answers each page with HTTP status 100 (more pages) or 200
+// (last page). (Confirmed on real hardware, issue #29.)
+static dc_status_t
+suunto_nautic_build_paginated_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
+	unsigned int seq, const unsigned char handle[3], unsigned int offset)
+{
+	static const unsigned char flags[] = { 0x01, 0x80, 0x00, 0x01, 0x06, 0x00 };
+	unsigned int payload = 3 + (unsigned int) sizeof (flags) + 4; // handle(3) + flags(6) + offset(4)
+	unsigned int len = 4 + 2 + payload + RPC_CRC_SIZE;
+	if (len > size)
+		return DC_STATUS_INVALIDARGS;
+
+	packet[0] = 0xA5;
+	packet[1] = RPC_OP_FETCH;
+	array_uint16_le_set (packet + 2, (unsigned short) payload);
+	array_uint16_le_set (packet + 4, (unsigned short) seq);
+	memcpy (packet + 6, handle, 3);
+	memcpy (packet + 9, flags, sizeof (flags));
+	array_uint32_le_set (packet + 9 + (unsigned int) sizeof (flags), offset);
 
 	unsigned int crc = checksum_crc32r (packet, 6 + payload);
 	array_uint32_le_set (packet + 6 + payload, crc);
@@ -669,6 +703,99 @@ suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_b
 	return DC_STATUS_SUCCESS;
 }
 
+// Fetch a resource the watch paginates (e.g. /Logbook/byId/<id>/Summary):
+// GET -> ACK(handle) -> repeated ranged 0x0D fetch, looping while the page
+// status is 100 (more pages) until 200 (last page), stripping the 10-byte
+// REST sub-header from each page and accumulating the raw (uncompressed)
+// SBEM bytes into `response`. The per-page REST sub-header (at packet+4) is
+// [msgid:2][handle:3][flags:3][status:2 LE].
+static dc_status_t
+suunto_nautic_device_paginated_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	dc_buffer_t *ack = dc_buffer_new (0);
+	if (ack == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	status = suunto_nautic_device_request (abstract, path, ack);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (ack);
+		ERROR (abstract->context, "Failed to request %s.", path);
+		return status;
+	}
+
+	const unsigned char *ack_data = dc_buffer_get_data (ack);
+	size_t ack_size = dc_buffer_get_size (ack);
+	if (ack_size < RPC_HANDLE_OFFSET + 3) {
+		dc_buffer_free (ack);
+		ERROR (abstract->context, "ACK too short for a handle (" DC_PRINTF_SIZE ").", ack_size);
+		return DC_STATUS_DATAFORMAT;
+	}
+	unsigned char handle[3];
+	memcpy (handle, ack_data + RPC_HANDLE_OFFSET, sizeof (handle));
+	dc_buffer_free (ack);
+
+	dc_buffer_clear (response);
+	unsigned int offset = 0;
+	const unsigned int header = 4 + 10; // A5 05 sublen(2) + 10-byte REST sub-header
+
+	for (unsigned int page = 0; page < MAX_PAGES; page++) {
+		unsigned char fetch[32];
+		unsigned int fetch_len = 0;
+		status = suunto_nautic_build_paginated_fetch (fetch, sizeof (fetch), &fetch_len,
+			device->sequence, handle, offset);
+		if (status != DC_STATUS_SUCCESS)
+			return status;
+		device->sequence++;
+
+		status = dc_iostream_write (device->iostream, fetch, fetch_len, NULL);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to send paginated fetch (offset=%u) for %s.", offset, path);
+			return status;
+		}
+
+		unsigned char packet[MAX_PACKET] = {0};
+		size_t len = 0;
+		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to receive page %u for %s.", page, path);
+			return status;
+		}
+
+		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "PFETCH RSP", packet, len);
+
+		if (len < RPC_STATUS_OFFSET + 2 || packet[0] != 0xA5 || packet[1] != RPC_OP_DATA) {
+			ERROR (abstract->context, "Unexpected frame for %s page %u (" DC_PRINTF_SIZE " bytes).", path, page, len);
+			return DC_STATUS_DATAFORMAT;
+		}
+
+		unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
+		if (frame_status != RPC_STATUS_OK && frame_status != RPC_STATUS_CONTINUE) {
+			ERROR (abstract->context, "Watch returned status %u for %s page %u.", frame_status, path, page);
+			return DC_STATUS_PROTOCOL;
+		}
+
+		if (len > header) {
+			if (!dc_buffer_append (response, packet + header, len - header)) {
+				ERROR (abstract->context, "Failed to allocate memory.");
+				return DC_STATUS_NOMEMORY;
+			}
+			offset += (unsigned int) (len - header);
+		}
+
+		if (frame_status == RPC_STATUS_OK) {
+			DEBUG (abstract->context, "Paginated fetch done: %u page(s), " DC_PRINTF_SIZE " bytes for %s.",
+				page + 1, dc_buffer_get_size (response), path);
+			return DC_STATUS_SUCCESS;
+		}
+	}
+
+	WARNING (abstract->context, "Paginated fetch hit the page limit for %s -- data may be truncated.", path);
+	return DC_STATUS_SUCCESS;
+}
+
 // Fetch a small whole resource (e.g. /Logbook/Entries) via the official
 // app's GET -> ACK(handle) -> SHORT-FETCH(0x0D) -> DATA(0x05) flow. The
 // listing endpoints don't answer the 0x0B/0x10 stream-fetch triggers, only
@@ -757,6 +884,23 @@ suunto_nautic_device_fetch (dc_device_t *abstract, const char *path, dc_buffer_t
 		return DC_STATUS_INVALIDARGS;
 
 	return suunto_nautic_device_short_fetch (abstract, path, response);
+}
+
+dc_status_t
+suunto_nautic_device_download_summary (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *summary)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || summary == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	char path[128];
+	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Summary", logbook_id);
+	if (n < 0 || (size_t) n >= sizeof (path))
+		return DC_STATUS_INVALIDARGS;
+
+	// /Summary uses the paginated 0x0D fetch and is NOT compressed -- the
+	// result is raw SBEM0103 (the caller locates the signature and reads
+	// its fields, e.g. gradient factors and gas mix).
+	return suunto_nautic_device_paginated_fetch (abstract, path, summary);
 }
 
 dc_status_t
