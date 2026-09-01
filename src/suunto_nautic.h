@@ -194,9 +194,12 @@
  * (best-effort), enumerate real dives via dc_device_foreach(), and
  * download + decode each one via suunto_nautic_device_download() +
  * suunto_nautic_parser_create() into a real depth/temperature/tank-
- * pressure/atmospheric-pressure profile. It does not yet decode dive
- * events or the other chunk IDs named above, and dc_parser_get_datetime()
- * is unsupported (see above for why that's lower-impact than it sounds).
+ * pressure/atmospheric-pressure/GPS profile with dive events (alarms,
+ * warnings, notifications, state changes, gas switches) and the correct
+ * delta-encoded sample times and dive time. dc_parser_get_datetime() is
+ * still unsupported (the per-sample timestamp is delta-encoded but the
+ * absolute dive start time in the stream isn't cracked yet; see above for
+ * why that's lower-impact than it sounds).
  *
  * Robustness note: Heatshrink decompression can leave localized
  * artifacts in the decoded stream (observed as runs of a single

@@ -86,6 +86,7 @@
 
 #define SBEM_MAGIC_SIZE 8
 
+#define CHUNK_TIMELINE_BASE   0x01
 #define CHUNK_ACTIVITY        0x08
 #define CHUNK_GPS             0x0B
 #define CHUNK_GPS_SATELLITES  0x0E
@@ -93,6 +94,21 @@
 #define CHUNK_PROFILE_1HZ     0x12
 #define CHUNK_EXTENDED_STATUS 0x16
 #define CHUNK_SURFACE_PRESSURE 0x17
+// Dive-event groups: the chunk id IS the event subgroup, each record is
+// [timeDelta:2 LE][Type:1][Active:1] (Active 1=begin/onset, 0=end/cleared).
+// Type indexes the subgroup's own enum (see the descriptor schema).
+#define CHUNK_EVENT_ALARM     0x18
+#define CHUNK_EVENT_WARNING   0x19
+#define CHUNK_EVENT_NOTIFY    0x1A
+#define CHUNK_EVENT_STATE     0x1B
+#define CHUNK_DIVE_STATE      0x1C // [timeDelta:2][state:1]; 0=Idling,1=Diving,2=Recovering
+#define CHUNK_DIVE_STATUS     0x1E // [timeDelta:2][active:1]; the DiveActive flag
+#define CHUNK_GAS_SWITCH      0x1F // [timeDelta:2][gasnumber:int16 LE]
+
+// DiveState values (CHUNK_DIVE_STATE payload).
+#define DIVE_STATE_IDLING     0
+#define DIVE_STATE_DIVING     1
+#define DIVE_STATE_RECOVERING 2
 
 #define MAX_TANKS 8
 #define MAX_GASMIXES 4
@@ -293,6 +309,48 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 	}
 }
 
+// Map a Suunto dive-event (subgroup = chunk id, plus the subgroup's Type
+// enum) to the closest libdivecomputer sample-event type. Suunto's set is
+// richer than dc_sample_event_t, so unmapped subtypes fall back to a
+// generic marker; the raw subgroup+type is still available via the
+// descriptor for anyone needing the exact Suunto label.
+static unsigned int
+suunto_nautic_map_event (unsigned int chunk_id, unsigned int type)
+{
+	switch (chunk_id) {
+	case CHUNK_EVENT_ALARM:
+		switch (type) {
+		case 1: case 2: return SAMPLE_EVENT_PO2;                 // PO2 Low/High
+		case 3:         return SAMPLE_EVENT_AIRTIME;             // Tank Pressure
+		case 5:         return SAMPLE_EVENT_ASCENT;              // Ascent Speed
+		case 10:        return SAMPLE_EVENT_CEILING;             // Deco Stop Broken
+		case 12:        return SAMPLE_EVENT_DEEPSTOP;            // Deep Stop Broken
+		case 13:        return SAMPLE_EVENT_SAFETYSTOP_MANDATORY;// Safety Stop Broken
+		default:        return SAMPLE_EVENT_VIOLATION;
+		}
+	case CHUNK_EVENT_WARNING:
+		switch (type) {
+		case 28:        return SAMPLE_EVENT_AIRTIME;             // User Tank Pressure
+		default:        return SAMPLE_EVENT_VIOLATION;
+		}
+	case CHUNK_EVENT_STATE:
+		switch (type) {
+		case 19:          return SAMPLE_EVENT_CEILING;           // Ndl exceeded
+		case 35: case 38: return SAMPLE_EVENT_DECOSTOP;          // At/Ahead Deco Stop
+		case 36: case 39: return SAMPLE_EVENT_DEEPSTOP;          // At/Ahead Deep Stop
+		case 37: case 40: return SAMPLE_EVENT_SAFETYSTOP;        // At/Ahead Safety Stop
+		default:          return SAMPLE_EVENT_BOOKMARK;
+		}
+	case CHUNK_EVENT_NOTIFY:
+		switch (type) {
+		case 11:        return SAMPLE_EVENT_GASCHANGE;           // Gas Switch
+		default:        return SAMPLE_EVENT_BOOKMARK;
+		}
+	default:
+		return SAMPLE_EVENT_BOOKMARK;
+	}
+}
+
 static dc_status_t
 suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata)
 {
@@ -309,7 +367,20 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	size_t profile_size = suunto_nautic_find_summary (abstract->data, abstract->size);
 
 	unsigned int offset = SBEM_MAGIC_SIZE;
-	unsigned int time = 0; // synthetic, see file header comment
+	// Time is delta-encoded: every chunk (except the timeline base 0x01)
+	// begins with a signed int16 LE millisecond delta at payload[0:2]. The
+	// running sum is the absolute sample time -- there is no per-sample
+	// absolute timestamp and no fixed sample rate.
+	int time_ms = 0;
+
+	// Dive phase, from CHUNK_DIVE_STATE. The stream carries brief spurious
+	// Diving/Recovering blips at the very start, so dive time is the LONGEST
+	// contiguous Diving span, not the first one. Average depth is taken over
+	// Diving samples only; counting from the first raw sample instead includes
+	// the pre-dive/surface phase and skews both low.
+	unsigned int dive_state = DIVE_STATE_IDLING;
+	int diving_start_ms = -1;
+	int max_dive_ms = 0;
 
 	double maxdepth = 0.0;
 	double depth_sum = 0.0;
@@ -331,6 +402,11 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 	sbem_chunk_t chunk;
 	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) profile_size, &offset, &chunk)) {
+		// Advance the clock by this chunk's leading ms delta (all groups
+		// except the timeline base carry one).
+		if (chunk.id != CHUNK_TIMELINE_BASE && chunk.size >= 2)
+			time_ms += (int16_t) array_uint16_le (chunk.data);
+
 		if (chunk.id == CHUNK_PROFILE_1HZ && chunk.size >= 18) {
 			double temperature = array_uint16_le (chunk.data + 16) / 100.0 - 273.15;
 
@@ -346,25 +422,26 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 			if (callback) {
 				dc_sample_value_t sample = {0};
-				sample.time = time * 1000;
+				sample.time = (unsigned int) time_ms;
 				callback (DC_SAMPLE_TIME, &sample, userdata);
 				sample.temperature = temperature;
 				callback (DC_SAMPLE_TEMPERATURE, &sample, userdata);
 			}
-
-			time++;
 		} else if (chunk.id == CHUNK_EXTENDED_STATUS) {
 			if (chunk.size >= 6) {
 				double depth = array_float_le (chunk.data + 2);
 
 				if (depth > maxdepth)
 					maxdepth = depth;
-				depth_sum += depth;
-				depth_count++;
+				// Average only over the Diving phase (matches the app).
+				if (dive_state == DIVE_STATE_DIVING) {
+					depth_sum += depth;
+					depth_count++;
+				}
 
 				if (callback) {
 					dc_sample_value_t sample = {0};
-					sample.time = time * 1000;
+					sample.time = (unsigned int) time_ms;
 					callback (DC_SAMPLE_TIME, &sample, userdata);
 					sample.depth = depth;
 					callback (DC_SAMPLE_DEPTH, &sample, userdata);
@@ -390,7 +467,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 					if (callback) {
 						dc_sample_value_t sample = {0};
-						sample.time = time * 1000;
+						sample.time = (unsigned int) time_ms;
 						callback (DC_SAMPLE_TIME, &sample, userdata);
 						sample.pressure.tank = i;
 						sample.pressure.value = bar;
@@ -412,12 +489,45 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 			if (callback) {
 				dc_sample_value_t sample = {0};
-				sample.time = time * 1000;
+				sample.time = (unsigned int) time_ms;
 				callback (DC_SAMPLE_TIME, &sample, userdata);
 				sample.location.latitude = lat_raw / 1.0e7;
 				sample.location.longitude = lon_raw / 1.0e7;
 				sample.location.altitude = 0.0;
 				callback (DC_SAMPLE_LOCATION, &sample, userdata);
+			}
+		} else if (chunk.id == CHUNK_DIVE_STATE && chunk.size >= 3) {
+			unsigned int new_state = chunk.data[2];
+			if (new_state == DIVE_STATE_DIVING && dive_state != DIVE_STATE_DIVING) {
+				diving_start_ms = time_ms;
+			} else if (new_state != DIVE_STATE_DIVING && dive_state == DIVE_STATE_DIVING) {
+				if (diving_start_ms >= 0 && time_ms - diving_start_ms > max_dive_ms)
+					max_dive_ms = time_ms - diving_start_ms;
+				diving_start_ms = -1;
+			}
+			dive_state = new_state;
+		} else if ((chunk.id == CHUNK_EVENT_ALARM || chunk.id == CHUNK_EVENT_WARNING ||
+				chunk.id == CHUNK_EVENT_NOTIFY || chunk.id == CHUNK_EVENT_STATE) && chunk.size >= 4) {
+			// [timeDelta:2][Type:1][Active:1]; Active 1=begin, 0=end.
+			if (callback) {
+				dc_sample_value_t sample = {0};
+				sample.time = (unsigned int) time_ms;
+				callback (DC_SAMPLE_TIME, &sample, userdata);
+				sample.event.type = suunto_nautic_map_event (chunk.id, chunk.data[2]);
+				sample.event.flags = chunk.data[3] ? SAMPLE_FLAGS_BEGIN : SAMPLE_FLAGS_END;
+				sample.event.value = 0;
+				callback (DC_SAMPLE_EVENT, &sample, userdata);
+			}
+		} else if (chunk.id == CHUNK_GAS_SWITCH && chunk.size >= 4) {
+			// [timeDelta:2][gasnumber:int16 LE].
+			if (callback) {
+				dc_sample_value_t sample = {0};
+				sample.time = (unsigned int) time_ms;
+				callback (DC_SAMPLE_TIME, &sample, userdata);
+				sample.event.type = SAMPLE_EVENT_GASCHANGE;
+				sample.event.flags = SAMPLE_FLAGS_BEGIN;
+				sample.event.value = (unsigned int) (int16_t) array_uint16_le (chunk.data + 2);
+				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_SURFACE_PRESSURE && chunk.size >= 6) {
 			// 3 Float32 values at offset 2/6/10 (SurfacePressure,
@@ -439,7 +549,17 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 		}
 	}
 
-	parser->divetime = time;
+	// A dive still in progress at the end of the stream closes the final span.
+	if (dive_state == DIVE_STATE_DIVING && diving_start_ms >= 0 &&
+			time_ms - diving_start_ms > max_dive_ms)
+		max_dive_ms = time_ms - diving_start_ms;
+
+	// Dive time = the longest Diving span (seconds). Fall back to the full
+	// elapsed time if no DiveState markers were seen.
+	if (max_dive_ms > 0)
+		parser->divetime = (unsigned int) ((max_dive_ms + 500) / 1000);
+	else
+		parser->divetime = (unsigned int) ((time_ms + 500) / 1000);
 	parser->maxdepth = maxdepth;
 	parser->avgdepth = depth_count ? depth_sum / depth_count : 0.0;
 	parser->have_temperature = have_temperature;
