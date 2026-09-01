@@ -69,6 +69,25 @@ dc_status_t
 suunto_nautic_device_fetch (dc_device_t *device, const char *path, dc_buffer_t *response);
 
 /*
+ * List dive ids (each is a UNIX-timestamp LogId), newest-first, without
+ * downloading the dives. `ids` receives the ids packed as little-endian
+ * uint32 (4 bytes each); read them back as a plain array. This is the cheap
+ * way to enumerate the logbook; the entry-parsing lives here in the driver so
+ * callers don't reimplement it.
+ */
+dc_status_t
+suunto_nautic_device_list (dc_device_t *device, dc_buffer_t *ids);
+
+/*
+ * The pure entry-parser behind suunto_nautic_device_list(): extract dive-start
+ * ids (newest-first) from a raw /Logbook/Entries response into `ids` (capacity
+ * `max_ids`), returning the count. Exposed so it can be unit-tested directly
+ * against captured entry buffers, with no device.
+ */
+unsigned int
+suunto_nautic_extract_entry_ids (const unsigned char data[], size_t size, unsigned int *ids, unsigned int max_ids);
+
+/*
  * Download a dive's /Summary (metadata: gradient factors, gas mix, ...).
  * Uses the paginated 0x0D fetch; `summary` receives the raw, uncompressed
  * SBEM0103 payload. The caller locates the "SBEM0103" signature and reads

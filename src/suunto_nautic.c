@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-deco-gf"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-entries-list"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -966,6 +966,86 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	return DC_STATUS_SUCCESS;
 }
 
+// Extract dive-start ids from a /Logbook/Entries response, newest-first. Each
+// entry is a start timestamp immediately followed by its end timestamp
+// (end > start, within a day), both 4-aligned little-endian uint32s in the
+// dive-ID window; a lone in-range value with no paired end is a header/misc
+// field (the response's own "current time"), not a dive. Writes up to max_ids
+// ids and returns the count. This is the single source of truth for entry
+// parsing -- both device_foreach and suunto_nautic_device_list use it, and the
+// Swift layer calls device_list rather than re-implementing this.
+unsigned int
+suunto_nautic_extract_entry_ids (const unsigned char *data, size_t size,
+	unsigned int *ids, unsigned int max_ids)
+{
+	unsigned int count = 0;
+	for (size_t i = 0; i + 8 <= size && count < max_ids; i += 4) {
+		unsigned int v = array_uint32_le (data + i);
+		if (v < DIVE_ID_MIN || v > DIVE_ID_MAX)
+			continue;
+		unsigned int next = array_uint32_le (data + i + 4);
+		if (next >= DIVE_ID_MIN && next <= DIVE_ID_MAX &&
+				next > v && next - v <= DIVE_ENTRY_MAX_PAIR_GAP) {
+			ids[count++] = v; // start of a (start, end) pair
+			i += 4;           // skip the paired end timestamp
+		}
+	}
+	// Sort descending (newest first); insertion sort is fine at logbook scale.
+	for (unsigned int a = 1; a < count; a++) {
+		unsigned int key = ids[a];
+		int b = (int) a - 1;
+		while (b >= 0 && ids[b] < key) { ids[b + 1] = ids[b]; b--; }
+		ids[b + 1] = key;
+	}
+	return count;
+}
+
+// Public: list dive ids (each a UNIX-timestamp LogId) newest-first, without
+// downloading the dives. Writes the ids as packed little-endian uint32 into
+// `out`; the caller reads them as a plain array (no protocol knowledge needed).
+dc_status_t
+suunto_nautic_device_list (dc_device_t *abstract, dc_buffer_t *out)
+{
+	if (out == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_buffer_t *entries = dc_buffer_new (0);
+	if (entries == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	dc_status_t status = suunto_nautic_device_short_fetch (abstract, "/Logbook/Entries", entries);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (entries);
+		return status;
+	}
+
+	const unsigned char *data = dc_buffer_get_data (entries);
+	size_t size = dc_buffer_get_size (entries);
+	size_t max_ids = size / 4 + 1;
+	unsigned int *ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
+	if (ids == NULL) {
+		dc_buffer_free (entries);
+		return DC_STATUS_NOMEMORY;
+	}
+	unsigned int count = suunto_nautic_extract_entry_ids (data, size, ids, (unsigned int) max_ids);
+	dc_buffer_free (entries);
+
+	dc_buffer_clear (out);
+	for (unsigned int i = 0; i < count; i++) {
+		unsigned char le[4];
+		le[0] = ids[i] & 0xFF;
+		le[1] = (ids[i] >> 8) & 0xFF;
+		le[2] = (ids[i] >> 16) & 0xFF;
+		le[3] = (ids[i] >> 24) & 0xFF;
+		if (!dc_buffer_append (out, le, sizeof (le))) {
+			free (ids);
+			return DC_STATUS_NOMEMORY;
+		}
+	}
+	free (ids);
+	return DC_STATUS_SUCCESS;
+}
+
 static dc_status_t
 suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata)
 {
@@ -1018,53 +1098,15 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	const unsigned char *entries_data = dc_buffer_get_data (entries);
 	size_t entries_size = dc_buffer_get_size (entries);
 
-	unsigned int count = 0;
-	unsigned int *ids = NULL;
-	if (entries_size >= 4) {
-		// Each entry stores its start timestamp (the LogId) immediately
-		// followed by the dive's end timestamp, both 4-aligned uint32s in the
-		// dive-ID window. Take only the starts: when an in-range value is
-		// immediately followed by a larger in-range value within a day, that
-		// is one entry's (start, end) pair, so take the start and skip the
-		// end. Otherwise a single dive lists as two (its end looks like a
-		// second dive id). Bytes between entries fall outside the window.
-		size_t max_ids = entries_size / 4; // at most one id per 4 bytes
-		ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
-		if (ids == NULL) {
-			dc_buffer_free (entries);
-			return DC_STATUS_NOMEMORY;
-		}
-		for (size_t i = 0; i + 4 <= entries_size; i += 4) {
-			unsigned int v = array_uint32_le (entries_data + i);
-			if (v < DIVE_ID_MIN || v > DIVE_ID_MAX)
-				continue;
-			ids[count++] = v;
-			if (i + 8 <= entries_size) {
-				unsigned int next = array_uint32_le (entries_data + i + 4);
-				if (next >= DIVE_ID_MIN && next <= DIVE_ID_MAX &&
-						next > v && next - v <= DIVE_ENTRY_MAX_PAIR_GAP)
-					i += 4; // skip this entry's paired end timestamp
-			}
-		}
+	size_t max_ids = entries_size / 4 + 1; // at most one id per 4 bytes
+	unsigned int *ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
+	if (ids == NULL) {
+		dc_buffer_free (entries);
+		return DC_STATUS_NOMEMORY;
 	}
+	unsigned int count = suunto_nautic_extract_entry_ids (entries_data, entries_size,
+		ids, (unsigned int) max_ids);
 	dc_buffer_free (entries);
-
-	// Sort descending (newest first). The endpoint's own ordering isn't
-	// documented; since every ID is itself a UNIX timestamp, sorting
-	// ourselves guarantees correct newest-first fingerprint-stop
-	// semantics below regardless of what order the watch actually
-	// returns them in. A plain insertion sort is fine here -- a dive
-	// computer's logbook is realistically dozens to low hundreds of
-	// entries, not a scale where O(n^2) matters.
-	for (unsigned int i = 1; i < count; i++) {
-		unsigned int key = ids[i];
-		int j = (int) i - 1;
-		while (j >= 0 && ids[j] < key) {
-			ids[j + 1] = ids[j];
-			j--;
-		}
-		ids[j + 1] = key;
-	}
 
 	progress.maximum = (count + 1) * 2;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
