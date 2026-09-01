@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-08-31-skip-empty-entries"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-01-entries-count-cap"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -66,6 +66,11 @@
 // unaligned read straddling two can invent a phantom dive.
 #define DIVE_ID_MIN 1500000000u
 #define DIVE_ID_MAX 2100000000u
+
+// Entry count in the /Logbook/Entries response, a little-endian uint32 at
+// this offset into the returned frame content (10-byte REST sub-header +
+// SBEM offset 6). Used to cap ID extraction before the SBEM tail bytes.
+#define ENTRIES_COUNT_OFFSET 16
 
 // Number of PMT-style chunks to accept before giving up. This is a safety
 // cap, not a protocol constant — the real termination condition (how the
@@ -856,13 +861,24 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	unsigned int count = 0;
 	unsigned int *ids = NULL;
 	if (entries_size >= 4) {
-		// At most one id per 4 bytes.
-		ids = (unsigned int *) malloc ((entries_size / 4) * sizeof (unsigned int));
+		// Cap extraction at the SBEM entry count. The payload ends with a
+		// per-request rolling token that can itself fall in the dive-ID
+		// window; stopping after `expected` values keeps that tail from
+		// being misread as a phantom entry.
+		size_t max_ids = entries_size / 4; // at most one id per 4 bytes
+		unsigned int expected = (unsigned int) max_ids;
+		if (entries_size >= ENTRIES_COUNT_OFFSET + 4) {
+			unsigned int n = array_uint32_le (entries_data + ENTRIES_COUNT_OFFSET);
+			if (n <= max_ids)
+				expected = n;
+		}
+
+		ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
 		if (ids == NULL) {
 			dc_buffer_free (entries);
 			return DC_STATUS_NOMEMORY;
 		}
-		for (size_t i = 0; i + 4 <= entries_size; i += 4) {
+		for (size_t i = 0; i + 4 <= entries_size && count < expected; i += 4) {
 			unsigned int v = array_uint32_le (entries_data + i);
 			if (v >= DIVE_ID_MIN && v <= DIVE_ID_MAX)
 				ids[count++] = v;
