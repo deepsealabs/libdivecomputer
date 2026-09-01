@@ -102,6 +102,7 @@
 #define VENDOR_KIND_GPS_ACCURACY 2 // [ehpe_m:u16][evpe_m:u16]
 #define VENDOR_KIND_IMU          3 // [ax,ay,az,gx,gy,gz,mx,my,mz:int16]
 #define VENDOR_KIND_DIVEROUTE    4 // [f0,f1,f2,f3,f4:uint16]
+#define VENDOR_KIND_GF           5 // [gf99:int16][gf_surface:int16][gf_leading:int16] (%)
 #define CHUNK_PROFILE_1HZ     0x12
 #define CHUNK_EXTENDED_STATUS 0x16
 #define CHUNK_SURFACE_PRESSURE 0x17
@@ -509,6 +510,47 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 						callback (DC_SAMPLE_PRESSURE, &sample, userdata);
 					}
 				}
+			}
+
+			// Deco/safety fields. Offsets validated 244/244 against the app's
+			// export: TTS uint16 @22 (s), NDL int16 @30 (s), Ceiling float32 @38
+			// (m). Ceiling/NDL/TTS use the standard DC_SAMPLE_DECO channel.
+			if (callback && chunk.size >= 42) {
+				unsigned int tts = array_uint16_le (chunk.data + 22);
+				int ndl = (int16_t) array_uint16_le (chunk.data + 30);
+				double ceiling = array_float_le (chunk.data + 38);
+
+				dc_sample_value_t t = {0};
+				t.time = (unsigned int) time_ms;
+				callback (DC_SAMPLE_TIME, &t, userdata);
+
+				dc_sample_value_t deco = {0};
+				if (ceiling > 0.0) {
+					deco.deco.type = DC_DECO_DECOSTOP;
+					deco.deco.depth = ceiling;
+					deco.deco.tts = tts;
+				} else {
+					deco.deco.type = DC_DECO_NDL;
+					deco.deco.time = ndl > 0 ? (unsigned int) ndl : 0;
+					deco.deco.tts = tts;
+				}
+				callback (DC_SAMPLE_DECO, &deco, userdata);
+			}
+
+			// Real-time gradient factors -> vendor kind 5 (no standard channel).
+			// gf99 @186 and surface @190 sit past the cylinder array; the
+			// leading-tissue GF @78 is inside that span, so it's only reliable
+			// while the upper tank slots are unused (as on this reference dive).
+			if (callback && chunk.size >= 192) {
+				int gf99    = (int16_t) array_uint16_le (chunk.data + 186);
+				int gf_surf = (int16_t) array_uint16_le (chunk.data + 190);
+				int gf_lead = (int16_t) array_uint16_le (chunk.data + 78);
+				unsigned char rec[7];
+				rec[0] = VENDOR_KIND_GF;
+				rec[1] = gf99 & 0xFF;    rec[2] = (gf99 >> 8) & 0xFF;
+				rec[3] = gf_surf & 0xFF; rec[4] = (gf_surf >> 8) & 0xFF;
+				rec[5] = gf_lead & 0xFF; rec[6] = (gf_lead >> 8) & 0xFF;
+				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
 			}
 		} else if (chunk.id == CHUNK_GPS && chunk.size >= 18) {
 			// Payload: [timeDelta:2][UTC:8 ms LE][lat:4][lon:4]. UTC is an
