@@ -195,11 +195,15 @@
  * download + decode each one via suunto_nautic_device_download() +
  * suunto_nautic_parser_create() into a real depth/temperature/tank-
  * pressure/atmospheric-pressure/GPS profile with dive events (alarms,
- * warnings, notifications, state changes, gas switches) and the correct
- * delta-encoded sample times and dive time. dc_parser_get_datetime() is
- * still unsupported (the per-sample timestamp is delta-encoded but the
- * absolute dive start time in the stream isn't cracked yet; see above for
- * why that's lower-impact than it sounds).
+ * warnings, notifications, state changes, gas switches), the correct
+ * delta-encoded sample times and dive time, and the dive datetime.
+ * dc_parser_get_datetime() derives the start time from the stream's only
+ * absolute clock: each GPS fix (chunk 0x0B) carries an absolute UTC in
+ * milliseconds, so start = gps_utc - gps_relative_time. That reconstructs
+ * the logbook id to the second (id 1787752091 = 2026-08-26T13:48:11Z,
+ * confirmed against the official app export). A dive with no surface GPS
+ * fix has no absolute clock in the stream, so datetime is unsupported for
+ * it there; the caller can fall back to the logbook id (the same value).
  *
  * Robustness note: Heatshrink decompression can leave localized
  * artifacts in the decoded stream (observed as runs of a single

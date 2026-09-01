@@ -142,6 +142,8 @@ typedef struct suunto_nautic_parser_t {
 	dc_location_t location;
 	unsigned int have_atmospheric;
 	double atmospheric; // bar
+	unsigned int have_datetime;
+	dc_ticks_t datetime; // dive start, UNIX seconds
 	// From the /Summary SBEM section appended after the profile, if present.
 	unsigned int ngasmixes;
 	dc_gasmix_t gasmix[MAX_GASMIXES];
@@ -155,6 +157,7 @@ typedef struct sbem_chunk_t {
 	unsigned int size;
 } sbem_chunk_t;
 
+static dc_status_t suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime);
 static dc_status_t suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value);
 static dc_status_t suunto_nautic_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata);
 
@@ -164,7 +167,7 @@ static const dc_parser_vtable_t suunto_nautic_parser_vtable = {
 	NULL, /* set_clock */
 	NULL, /* set_atmospheric */
 	NULL, /* set_density */
-	NULL, /* datetime -- no timestamp chunk identified yet, see file header */
+	suunto_nautic_parser_get_datetime, /* datetime */
 	suunto_nautic_parser_get_field,
 	suunto_nautic_parser_samples_foreach,
 	NULL, /* destroy */
@@ -400,6 +403,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	unsigned int have_atmospheric = 0;
 	double atmospheric = 0.0;
 
+	unsigned int have_datetime = 0;
+
 	sbem_chunk_t chunk;
 	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) profile_size, &offset, &chunk)) {
 		// Advance the clock by this chunk's leading ms delta (all groups
@@ -476,9 +481,20 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				}
 			}
 		} else if (chunk.id == CHUNK_GPS && chunk.size >= 18) {
-			// Latitude/longitude are Int32 LE, degrees * 1e7.
+			// Payload: [timeDelta:2][UTC:8 ms LE][lat:4][lon:4]. UTC is an
+			// absolute UNIX time in milliseconds; subtracting this sample's
+			// relative time (time_ms) yields the stream-start epoch, i.e. the
+			// dive start (== the logbook id, confirmed to the second). This is
+			// the only absolute clock in the stream, so the first GPS fix sets
+			// the dive datetime.
+			unsigned long long utc_ms = array_uint64_le (chunk.data + 2);
 			int lat_raw = (int) array_uint32_le (chunk.data + 10);
 			int lon_raw = (int) array_uint32_le (chunk.data + 14);
+
+			if (!have_datetime && utc_ms > (unsigned long long) time_ms) {
+				have_datetime = 1;
+				parser->datetime = (dc_ticks_t) ((utc_ms - (unsigned long long) time_ms) / 1000);
+			}
 
 			if (!have_location) {
 				have_location = 1;
@@ -571,6 +587,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->location = location;
 	parser->have_atmospheric = have_atmospheric;
 	parser->atmospheric = atmospheric;
+	parser->have_datetime = have_datetime;
 
 	// Gradient factors and gas mixes from the appended /Summary section.
 	parser->ngasmixes = 0;
@@ -583,6 +600,29 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	}
 
 	parser->cached = 1;
+
+	return DC_STATUS_SUCCESS;
+}
+
+static dc_status_t
+suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime)
+{
+	suunto_nautic_parser_t *parser = (suunto_nautic_parser_t *) abstract;
+
+	if (!parser->cached) {
+		dc_status_t status = suunto_nautic_parser_parse (abstract, NULL, NULL);
+		if (status != DC_STATUS_SUCCESS)
+			return status;
+	}
+
+	// The dive start is derived from the first GPS fix's absolute UTC. A dive
+	// without a surface GPS fix has no absolute clock in the stream; the caller
+	// falls back to the logbook id (which is that same timestamp).
+	if (!parser->have_datetime)
+		return DC_STATUS_UNSUPPORTED;
+
+	if (datetime && !dc_datetime_gmtime (datetime, parser->datetime))
+		return DC_STATUS_DATAFORMAT;
 
 	return DC_STATUS_SUCCESS;
 }
