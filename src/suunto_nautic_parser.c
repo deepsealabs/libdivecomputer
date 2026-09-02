@@ -413,14 +413,16 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	// absolute timestamp and no fixed sample rate.
 	int time_ms = 0;
 
-	// Dive phase, from CHUNK_DIVE_STATE. The stream carries brief spurious
-	// Diving/Recovering blips at the very start, so dive time is the LONGEST
-	// contiguous Diving span, not the first one. Average depth is taken over
-	// Diving samples only; counting from the first raw sample instead includes
-	// the pre-dive/surface phase and skews both low.
+	// Dive phase, from CHUNK_DIVE_STATE. Dive time is the TOTAL time spent in
+	// the Diving state (sum of every Diving span), which matches the app's
+	// DiveTimeMax on multi-level dives that briefly surface mid-dive -- taking
+	// only the longest single span undercounts those. A spurious ~0 s startup
+	// blip contributes nothing. Average depth is taken over Diving samples only;
+	// counting from the first raw sample would include the pre-dive/surface
+	// phase and skew both low.
 	unsigned int dive_state = DIVE_STATE_IDLING;
 	int diving_start_ms = -1;
-	int max_dive_ms = 0;
+	int total_dive_ms = 0;
 
 	double maxdepth = 0.0;
 	double depth_sum = 0.0;
@@ -618,8 +620,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			if (new_state == DIVE_STATE_DIVING && dive_state != DIVE_STATE_DIVING) {
 				diving_start_ms = time_ms;
 			} else if (new_state != DIVE_STATE_DIVING && dive_state == DIVE_STATE_DIVING) {
-				if (diving_start_ms >= 0 && time_ms - diving_start_ms > max_dive_ms)
-					max_dive_ms = time_ms - diving_start_ms;
+				if (diving_start_ms >= 0)
+					total_dive_ms += time_ms - diving_start_ms;
 				diving_start_ms = -1;
 			}
 			dive_state = new_state;
@@ -721,14 +723,13 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	}
 
 	// A dive still in progress at the end of the stream closes the final span.
-	if (dive_state == DIVE_STATE_DIVING && diving_start_ms >= 0 &&
-			time_ms - diving_start_ms > max_dive_ms)
-		max_dive_ms = time_ms - diving_start_ms;
+	if (dive_state == DIVE_STATE_DIVING && diving_start_ms >= 0)
+		total_dive_ms += time_ms - diving_start_ms;
 
-	// Dive time = the longest Diving span (seconds). Fall back to the full
-	// elapsed time if no DiveState markers were seen.
-	if (max_dive_ms > 0)
-		parser->divetime = (unsigned int) ((max_dive_ms + 500) / 1000);
+	// Dive time = total time in the Diving state (seconds). Fall back to the
+	// full elapsed time if no DiveState markers were seen.
+	if (total_dive_ms > 0)
+		parser->divetime = (unsigned int) ((total_dive_ms + 500) / 1000);
 	else
 		parser->divetime = (unsigned int) ((time_ms + 500) / 1000);
 	parser->maxdepth = maxdepth;
