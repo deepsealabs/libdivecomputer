@@ -134,8 +134,13 @@
 // "SBEM0103" signature), confirmed against real hardware. The dive profile
 // (/Data) carries samples but not these; the driver appends the /Summary
 // SBEM after the profile so this parser can expose them the standard way.
-#define SUMMARY_GF_LOW   0x33 // uint16 LE, %
-#define SUMMARY_GF_HIGH  0x35 // uint16 LE, %
+// GF low is at 0x35 and GF high at 0x33 (uint16 LE, %). Confirmed against real
+// Summaries from two devices: Nautic reads 35/75 and Nautic S 40/85 only with
+// this ordering; the reverse gives low > high, which is physically invalid. The
+// app's JSON export does not carry GF, so this is validated by the low <= high
+// invariant plus urbamax's independent Summary reading (issue #29).
+#define SUMMARY_GF_LOW   0x35 // uint16 LE, %
+#define SUMMARY_GF_HIGH  0x33 // uint16 LE, %
 #define SUMMARY_GAS_BASE 0xC7 // first gas; 4 bytes each: id, O2%, He%, type
 
 typedef struct suunto_nautic_tank_t {
@@ -302,7 +307,7 @@ suunto_nautic_find_summary (const unsigned char *data, size_t size)
 static void
 suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char *sbem, size_t size)
 {
-	if (size >= SUMMARY_GF_HIGH + 2) {
+	if (size >= SUMMARY_GF_LOW + 2) { // GF_LOW (0x35) is the higher of the two offsets
 		unsigned int low = array_uint16_le (sbem + SUMMARY_GF_LOW);
 		unsigned int high = array_uint16_le (sbem + SUMMARY_GF_HIGH);
 		parser->decomodel.type = DC_DECOMODEL_BUHLMANN;

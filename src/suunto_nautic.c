@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-extstatus-varlen"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-gf-order"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
