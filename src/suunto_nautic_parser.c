@@ -502,19 +502,22 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			// tank pressure on the Nautic S -- validated offset 44 against a
 			// Nautic S pod dive's app JSON (207 -> 40 bar, issue #29).
 			{
-				// The full 8-slot array is only present on the 195 B
-				// Ocean/Nautic chunk. The shorter Nautic S chunk (141 B) still
-				// carries tank 0 at the same offset 44, but the bytes past it
-				// are unrelated and occasionally look like a valid tank slot, so
-				// read only tank 0 there rather than inventing phantom tanks.
-				unsigned int ntank_slots = (chunk.size >= 42 + MAX_TANKS * 18) ? MAX_TANKS : 1;
-				for (unsigned int i = 0; i < ntank_slots; i++) {
+				// Read every cylinder slot whose FULL 18-byte record fits in
+				// this chunk: the 195 B chunk holds all 8, the shorter 141 B
+				// chunk (Nautic S and some Ocean firmware) holds slots 0-4.
+				// Requiring the whole record (base + 18) rather than just the
+				// pressure field excludes the partial slot past the end, whose
+				// bytes would otherwise occasionally look like a phantom tank.
+				// Each real record starts with its own index byte, so stop at
+				// the first slot whose leading byte isn't its index. Confirmed
+				// on real hardware: slots 0-4 carry idx 0-4 on the 141 B chunk;
+				// tank 0 pressure is at offset 44 on both layouts (issue #29).
+				for (unsigned int i = 0; i < MAX_TANKS; i++) {
 					unsigned int base = 42 + i * 18;
-					if (base + 6 > chunk.size)
-						break; // tank record doesn't fit this chunk
-					// Each real tank record begins with its own index byte.
+					if (base + 18 > chunk.size)
+						break; // full tank record doesn't fit this chunk
 					if (chunk.data[base] != i)
-						break;
+						break; // not a real tank slot
 					unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2);
 					if (pressure_pa == 0)
 						continue; // not installed, per the issue's mapping
