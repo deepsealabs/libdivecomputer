@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-nautics-tank"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-03-entries-page100"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -926,9 +926,16 @@ suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_bu
 		return DC_STATUS_DATAFORMAT;
 	}
 
+	// 200 = the whole resource fits in this one frame. 100 = a paginated first
+	// page: the watch has more entries than one page holds and would serve the
+	// rest via a continuation request. We don't follow the continuation yet, so
+	// accept the page we got (returning its dives) rather than failing -- on a
+	// watch with many dives /Logbook/Entries returns 100 and this is what made
+	// List Dives error with -8 (issue #29). The returned page holds the most
+	// recent dives; older ones beyond it need continuation support (TODO).
 	unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
-	if (frame_status != RPC_STATUS_OK) {
-		ERROR (abstract->context, "Watch returned status %u for %s (200 expected).", frame_status, path);
+	if (frame_status != RPC_STATUS_OK && frame_status != RPC_STATUS_CONTINUE) {
+		ERROR (abstract->context, "Watch returned status %u for %s (200/100 expected).", frame_status, path);
 		dc_buffer_free (frame);
 		return DC_STATUS_PROTOCOL;
 	}
