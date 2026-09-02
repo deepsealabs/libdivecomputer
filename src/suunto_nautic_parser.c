@@ -493,11 +493,28 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				}
 			}
 
-			// Cylinders array: 8 elements of 18 bytes, starting at
+			// Cylinders array: up to 8 elements of 18 bytes, starting at
 			// offset 42 (idx:1, ?:1, pressure:4 LE Pa, pressure2:4 LE Pa, ...).
-			if (chunk.size >= 42 + MAX_TANKS * 18) {
-				for (unsigned int i = 0; i < MAX_TANKS; i++) {
+			// Read each tank only if its record fits: the shorter Nautic S
+			// extended-status (141 B) holds fewer tank slots than the 195 B
+			// Ocean/Nautic one, but tank 0's pressure is at the same offset 44
+			// on both. Requiring the full 8-slot array (186 B) dropped ALL
+			// tank pressure on the Nautic S -- validated offset 44 against a
+			// Nautic S pod dive's app JSON (207 -> 40 bar, issue #29).
+			{
+				// The full 8-slot array is only present on the 195 B
+				// Ocean/Nautic chunk. The shorter Nautic S chunk (141 B) still
+				// carries tank 0 at the same offset 44, but the bytes past it
+				// are unrelated and occasionally look like a valid tank slot, so
+				// read only tank 0 there rather than inventing phantom tanks.
+				unsigned int ntank_slots = (chunk.size >= 42 + MAX_TANKS * 18) ? MAX_TANKS : 1;
+				for (unsigned int i = 0; i < ntank_slots; i++) {
 					unsigned int base = 42 + i * 18;
+					if (base + 6 > chunk.size)
+						break; // tank record doesn't fit this chunk
+					// Each real tank record begins with its own index byte.
+					if (chunk.data[base] != i)
+						break;
 					unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2);
 					if (pressure_pa == 0)
 						continue; // not installed, per the issue's mapping
