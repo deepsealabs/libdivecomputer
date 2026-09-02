@@ -104,7 +104,12 @@
 #define VENDOR_KIND_DIVEROUTE    4 // [f0,f1,f2,f3,f4:uint16]
 #define VENDOR_KIND_GF           5 // [gf99:int16][gf_surface:int16][gf_leading:int16] (%)
 #define CHUNK_PROFILE_1HZ     0x12
-#define CHUNK_EXTENDED_STATUS 0x16
+#define CHUNK_EXTENDED_STATUS 0x16 // VARIABLE length (195 on Ocean/Nautic, 141
+                                   // on Nautic S and other firmware); fields are
+                                   // read by offset, each guarded by chunk.size.
+                                   // NOT in the fixed-length table -- hardcoding
+                                   // 195 rejected every Nautic S chunk as a ghost
+                                   // and broke depth/divetime/deco (issue #29).
 #define CHUNK_SURFACE_PRESSURE 0x17
 // Dive-event groups: the chunk id IS the event subgroup, each record is
 // [timeDelta:2 LE][Type:1][Active:1] (Active 1=begin/onset, 0=end/cleared).
@@ -222,7 +227,6 @@ suunto_nautic_sbem_fixed_length (unsigned int id)
 	case CHUNK_GPS:              return 20;
 	case CHUNK_GPS_ACCURACY:     return 6;
 	case CHUNK_BATTERY:          return 7;
-	case CHUNK_EXTENDED_STATUS:  return 195;
 	case CHUNK_SURFACE_PRESSURE: return 14;
 	default:                     return -1; // unknown or variable length
 	}
