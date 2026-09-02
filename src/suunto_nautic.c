@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-entries-paginate"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-entries-short-fetch"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -960,13 +960,17 @@ suunto_nautic_device_fetch_raw (dc_device_t *abstract, const char *path, dc_buff
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
 		return DC_STATUS_INVALIDARGS;
 
-	// Diagnostic: capture the FULL resource via the paginated fetch, which
-	// demuxes by handle and follows continuation (status 100) pages to the
-	// final 200. A large logbook spans several pages, so the earlier
-	// single-frame grab only caught one interleaved frame (device info /
-	// analytics) and its size varied per tap. This returns the concatenated
-	// content so an unfamiliar entries format can be reverse-engineered.
-	return suunto_nautic_device_paginated_fetch (abstract, path, response);
+	// Diagnostic: return the raw DATA frame exactly as the watch sends it
+	// (the whole A5 05 .. packet, no opcode/status validation), so a tester
+	// can export whatever came back even when parsing fails. This mirrors the
+	// real listing path: /Logbook/Entries answers only the SHORT (no-range)
+	// 0x0D fetch and replies with a single complete status-200 frame. The
+	// ranged/paginated fetch is for /Summary only -- /Entries rejects it, which
+	// is why routing this diagnostic through paginated_fetch returned a
+	// non-100/200 status (DC_STATUS_PROTOCOL). The earlier "size varied per
+	// tap" was the Suunto app running concurrently and racing on the BLE link;
+	// with that app closed the short fetch returns a clean, complete frame.
+	return suunto_nautic_short_fetch_frame (abstract, path, response, 1);
 }
 
 dc_status_t
