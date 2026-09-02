@@ -435,6 +435,19 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	unsigned int ntanks = 0;
 	suunto_nautic_tank_t tank[MAX_TANKS];
 	memset (tank, 0, sizeof (tank));
+	// Each cylinder slot has two pressure fields: Pressure (+2, the main
+	// transmitter) and Pressure2 (+6, a sidemount second transmitter). Map
+	// each (slot, field) with data to a compacted tank index. Pressure2 is
+	// gated: a real second transmitter produces a continuous non-zero
+	// curve, whereas a slot with no second transmitter emits a single
+	// spurious Pressure2 sample then zeros -- so only accept Pressure2 once
+	// it has read non-zero at least twice (p2_first holds the first value).
+	int tankmap[MAX_TANKS * 2];
+	int p2_first[MAX_TANKS];
+	for (unsigned int ti = 0; ti < MAX_TANKS * 2; ti++)
+		tankmap[ti] = -1;
+	for (unsigned int ti = 0; ti < MAX_TANKS; ti++)
+		p2_first[ti] = -1;
 
 	unsigned int have_location = 0;
 	dc_location_t location = {0};
@@ -520,25 +533,40 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 						break; // full tank record doesn't fit this chunk
 					if (chunk.data[base] != i)
 						break; // not a real tank slot
-					unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2);
-					if (pressure_pa == 0)
-						continue; // not installed, per the issue's mapping
-
-					double bar = pressure_pa / 100000.0;
-					if (!tank[i].used) {
-						tank[i].used = 1;
-						tank[i].beginpressure = bar;
-						ntanks++;
-					}
-					tank[i].endpressure = bar;
-
-					if (callback) {
-						dc_sample_value_t sample = {0};
-						sample.time = (unsigned int) time_ms;
-						callback (DC_SAMPLE_TIME, &sample, userdata);
-						sample.pressure.tank = i;
-						sample.pressure.value = bar;
-						callback (DC_SAMPLE_PRESSURE, &sample, userdata);
+					for (unsigned int field = 0; field < 2; field++) {
+						unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2 + field * 4);
+						if (pressure_pa == 0)
+							continue;
+						unsigned int key = i * 2 + field;
+						if (field == 1 && tankmap[key] < 0) {
+							// Defer creating a Pressure2 tank until its second non-zero
+							// reading, so a lone spurious sample doesn't become a phantom.
+							if (p2_first[i] < 0) {
+								p2_first[i] = (int) pressure_pa;
+								continue;
+							}
+						}
+						double bar = pressure_pa / 100000.0;
+						if (tankmap[key] < 0) {
+							if (ntanks >= MAX_TANKS)
+								continue;
+							tankmap[key] = (int) ntanks;
+							tank[ntanks].used = 1;
+							// Begin from the first observed reading (the deferred one for Pressure2).
+							tank[ntanks].beginpressure = (field == 1 && p2_first[i] >= 0)
+								? p2_first[i] / 100000.0 : bar;
+							ntanks++;
+						}
+						unsigned int t = (unsigned int) tankmap[key];
+						tank[t].endpressure = bar;
+						if (callback) {
+							dc_sample_value_t sample = {0};
+							sample.time = (unsigned int) time_ms;
+							callback (DC_SAMPLE_TIME, &sample, userdata);
+							sample.pressure.tank = t;
+							sample.pressure.value = bar;
+							callback (DC_SAMPLE_PRESSURE, &sample, userdata);
+						}
 					}
 				}
 			}
