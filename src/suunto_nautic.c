@@ -37,7 +37,7 @@
 // Logged (INFO) on every device open so a log proves which C driver build
 // is running (this submodule can lag the Swift package if a pull doesn't
 // update it).
-#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-fetch-handle"
+#define SUUNTO_NAUTIC_DRIVER_TAG "2026-09-02-entries-paginate"
 
 #define RPC_OP_GET           0x0A
 #define RPC_OP_STREAM_FETCH1 0x0B
@@ -756,19 +756,31 @@ suunto_nautic_device_paginated_fetch (dc_device_t *abstract, const char *path, d
 			return status;
 		}
 
+		// Read the page, skipping unsolicited/interleaved frames: the watch
+		// multiplexes other resources (device info, analytics, a re-sent Hello)
+		// on the same link, so accept only a DATA (0x05) frame whose handle
+		// matches this fetch. Otherwise we'd splice a foreign frame into the
+		// paginated stream.
 		unsigned char packet[MAX_PACKET] = {0};
 		size_t len = 0;
-		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
-		if (status != DC_STATUS_SUCCESS) {
-			ERROR (abstract->context, "Failed to receive page %u for %s.", page, path);
-			return status;
-		}
-
-		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "PFETCH RSP", packet, len);
-
-		if (len < RPC_STATUS_OFFSET + 2 || packet[0] != 0xA5 || packet[1] != RPC_OP_DATA) {
-			ERROR (abstract->context, "Unexpected frame for %s page %u (" DC_PRINTF_SIZE " bytes).", path, page, len);
-			return DC_STATUS_DATAFORMAT;
+		unsigned int skips = 0;
+		const unsigned int max_skips = 8;
+		for (;;) {
+			status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+			if (status != DC_STATUS_SUCCESS) {
+				ERROR (abstract->context, "Failed to receive page %u for %s.", page, path);
+				return status;
+			}
+			HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "PFETCH RSP", packet, len);
+			if (len >= RPC_HANDLE_OFFSET + 3 && packet[0] == 0xA5 && packet[1] == RPC_OP_DATA &&
+					memcmp (packet + RPC_HANDLE_OFFSET, handle, sizeof (handle)) == 0)
+				break;
+			if (++skips >= max_skips) {
+				ERROR (abstract->context, "Unexpected frame for %s page %u (" DC_PRINTF_SIZE " bytes).", path, page, len);
+				return DC_STATUS_DATAFORMAT;
+			}
+			WARNING (abstract->context, "Skipping interleaved frame while paging %s (op 0x%02x).",
+				path, len >= 2 ? packet[1] : 0);
 		}
 
 		unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
@@ -948,11 +960,13 @@ suunto_nautic_device_fetch_raw (dc_device_t *abstract, const char *path, dc_buff
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
 		return DC_STATUS_INVALIDARGS;
 
-	// Diagnostic: return the raw fetch frame the watch sends, without requiring
-	// it to be a well-formed DATA (0x05) frame. Used to export the actual bytes
-	// when a normal fetch fails (e.g. /Logbook/Entries returning DATAFORMAT), so
-	// unknown per-device response formats can be reverse-engineered.
-	return suunto_nautic_short_fetch_frame (abstract, path, response, 0);
+	// Diagnostic: capture the FULL resource via the paginated fetch, which
+	// demuxes by handle and follows continuation (status 100) pages to the
+	// final 200. A large logbook spans several pages, so the earlier
+	// single-frame grab only caught one interleaved frame (device info /
+	// analytics) and its size varied per tap. This returns the concatenated
+	// content so an unfamiliar entries format can be reverse-engineered.
+	return suunto_nautic_device_paginated_fetch (abstract, path, response);
 }
 
 dc_status_t
