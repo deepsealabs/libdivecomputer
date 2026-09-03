@@ -132,6 +132,7 @@
 #define CHUNK_EVENT_STATE     0x1B
 #define CHUNK_DIVE_STATE      0x1C // [timeDelta:2][state:1]; 0=Idling,1=Diving,2=Recovering
 #define CHUNK_DIVE_STATUS     0x1E // [timeDelta:2][active:1]; the DiveActive flag
+#define CHUNK_OOAM            0x1D // [timeDelta:2][type:1]; one-shot dive-end reason (Ooam.Type)
 #define CHUNK_GAS_SWITCH      0x1F // [timeDelta:2][gasnumber:int16 LE]
 
 // DiveState values (CHUNK_DIVE_STATE payload).
@@ -681,6 +682,21 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				callback (DC_SAMPLE_TIME, &sample, userdata);
 				sample.event.type = suunto_nautic_map_event (chunk.id, chunk.data[2]);
 				sample.event.flags = chunk.data[3] ? SAMPLE_FLAGS_BEGIN : SAMPLE_FLAGS_END;
+				sample.event.value = (chunk.id << 8) | chunk.data[2];
+				callback (DC_SAMPLE_EVENT, &sample, userdata);
+			}
+		} else if (chunk.id == CHUNK_OOAM && chunk.size >= 3) {
+			// [timeDelta:2][Type:1]; one-shot dive-end reason (Ooam.Type: Out of
+			// battery / Ceiling broken / SW crash / Max depth / Algorithm changed
+			// / Gauge dive). No Active byte. Emitted as a begin-edge event; the
+			// native (subgroup, type) is passed in event.value = (chunk_id<<8|type)
+			// for the precise Suunto label, same convention as the other events.
+			if (callback) {
+				dc_sample_value_t sample = {0};
+				sample.time = (unsigned int) time_ms;
+				callback (DC_SAMPLE_TIME, &sample, userdata);
+				sample.event.type = suunto_nautic_map_event (chunk.id, chunk.data[2]);
+				sample.event.flags = SAMPLE_FLAGS_BEGIN;
 				sample.event.value = (chunk.id << 8) | chunk.data[2];
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
