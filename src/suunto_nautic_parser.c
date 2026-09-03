@@ -91,8 +91,19 @@
 #define CHUNK_GPS             0x0B
 #define CHUNK_GPS_ACCURACY    0x0E // [timeDelta:2][dEHPE:int8][dEVPE:int8][?:2]
 #define CHUNK_BATTERY         0x14 // [timeDelta:2][current:int16][voltage:uint16 mV][charge:uint8 %]
-#define CHUNK_IMU             0x23 // [timeDelta:2][algoTS:uint32][accel/gyro/mag X,Y,Z:int16]
-#define CHUNK_DIVEROUTE       0x24 // [timeDelta:2][algoTS:uint32][5x uint16 route features]
+// High-rate IMU: [timeDelta:2][algoTS:uint32][accel/gyro/mag X,Y,Z:int16], a
+// 24-byte payload. The chunk id is FIRMWARE-DEPENDENT: 0x23 on the 195-byte
+// extended-status watches (Nautic), 0x22 on the 141-byte ones (Nautic S /
+// Ocean). Both are matched by (id in {0x22,0x23} AND payload >= 24); see the
+// IMU handler. Keying on the id alone silently dropped IMU on 141-byte watches.
+#define CHUNK_IMU             0x23
+#define CHUNK_IMU_ALT         0x22
+// A 2 Hz auxiliary record of 5x int16 (16-byte payload), id 0x24 on 195-byte
+// watches and 0x23 (small) on 141-byte ones. Previously mislabelled "DiveRoute":
+// the dive-route X/Y/Z track is NOT stored in the profile on any device (the
+// watch logs raw IMU and the app dead-reckons the track afterwards). Semantics
+// of these 5 fields are unknown; carried through verbatim for future analysis.
+#define CHUNK_AUX2HZ          0x24
 
 // libdivecomputer has no dedicated battery/GPS-accuracy/IMU sample types, so
 // these are delivered through the generic DC_SAMPLE_VENDOR channel tagged
@@ -101,7 +112,7 @@
 #define VENDOR_KIND_BATTERY      1 // [voltage_mv:u16][charge_permille:u16]
 #define VENDOR_KIND_GPS_ACCURACY 2 // [ehpe_m:u16][evpe_m:u16]
 #define VENDOR_KIND_IMU          3 // [ax,ay,az,gx,gy,gz,mx,my,mz:int16]
-#define VENDOR_KIND_DIVEROUTE    4 // [f0,f1,f2,f3,f4:uint16]
+#define VENDOR_KIND_AUX2HZ       4 // [f0,f1,f2,f3,f4:int16] 2 Hz aux (semantics unknown; not the dive route)
 #define VENDOR_KIND_GF           5 // [gf99:int16][gf_surface:int16][gf_leading:int16] (%)
 #define CHUNK_PROFILE_1HZ     0x12
 #define CHUNK_EXTENDED_STATUS 0x16 // VARIABLE length (195 on Ocean/Nautic, 141
@@ -713,20 +724,28 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				rec[3] = v & 0xFF; rec[4] = (v >> 8) & 0xFF;
 				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
 			}
-		} else if (chunk.id == CHUNK_IMU && chunk.size >= 24) {
-			// 9x int16 (accel/gyro/mag X,Y,Z) at offset 6, already little-endian
-			// -> DC_SAMPLE_VENDOR kind 3, passed through verbatim.
+		} else if ((chunk.id == CHUNK_IMU || chunk.id == CHUNK_IMU_ALT) && chunk.size >= 24) {
+			// High-rate IMU: 9x int16 (accel/gyro/mag X,Y,Z) at offset 6, already
+			// little-endian -> DC_SAMPLE_VENDOR kind 3, passed through verbatim.
+			// Matched by shape (payload >= 24) across both id variants (0x23 on
+			// 195-byte watches, 0x22 on 141-byte ones) so IMU decodes on all
+			// firmware, not just the id-0x23 devices.
 			if (callback) {
 				unsigned char rec[1 + 18];
 				rec[0] = VENDOR_KIND_IMU;
 				memcpy (rec + 1, chunk.data + 6, 18);
 				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
 			}
-		} else if (chunk.id == CHUNK_DIVEROUTE && chunk.size >= 16) {
-			// 5x uint16 route features at offset 6 -> DC_SAMPLE_VENDOR kind 4.
+		} else if ((chunk.id == CHUNK_AUX2HZ || chunk.id == CHUNK_IMU) &&
+				chunk.size >= 10 && chunk.size <= 16) {
+			// 2 Hz auxiliary: 5x int16 at offset 6 -> DC_SAMPLE_VENDOR kind 4.
+			// Id is 0x24 on 195-byte watches and 0x23 (small, payload 16) on
+			// 141-byte ones; the payload bound (<= 16) excludes the 141-byte
+			// 0x24 summary record so it is no longer misread as this channel.
+			// NOT the dive route (which the watch does not store); semantics TBD.
 			if (callback) {
 				unsigned char rec[1 + 10];
-				rec[0] = VENDOR_KIND_DIVEROUTE;
+				rec[0] = VENDOR_KIND_AUX2HZ;
 				memcpy (rec + 1, chunk.data + 6, 10);
 				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
 			}
