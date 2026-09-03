@@ -89,6 +89,9 @@
 #include <libdivecomputer/parser.h>
 #include <libdivecomputer/buffer.h>
 
+/* Family-specific public API (download by logbook id, protocol helpers). */
+#include <libdivecomputer/suunto_nautic.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */

@@ -391,7 +391,7 @@ suunto_nautic_device_close (dc_device_t *abstract)
 	return dc_iostream_close (device->iostream);
 }
 
-static dc_status_t
+dc_status_t
 suunto_nautic_device_request (dc_device_t *abstract, const char *path, dc_buffer_t *response)
 {
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL)
@@ -710,7 +710,9 @@ suunto_nautic_device_paginated_fetch (dc_device_t *abstract, const char *path, d
 // one DATA frame, which holds for a normal logbook.
 // GET -> ACK(handle) -> 0x0D short fetch -> read one frame. Returns the RAW
 // frame bytes (the whole A5.. packet) in `frame`, with NO opcode validation.
-// suunto_nautic_device_short_fetch() validates and extracts the content.
+// suunto_nautic_device_short_fetch() validates and extracts the content; the
+// raw diagnostic (suunto_nautic_device_fetch_raw) returns the frame as-is so a
+// tester can export whatever the watch actually sent when parsing fails.
 static dc_status_t
 suunto_nautic_short_fetch_frame (dc_device_t *abstract, const char *path, dc_buffer_t *frame, int skip_non_data)
 {
@@ -842,7 +844,35 @@ suunto_nautic_device_short_fetch (dc_device_t *abstract, const char *path, dc_bu
 	return DC_STATUS_SUCCESS;
 }
 
-static dc_status_t
+dc_status_t
+suunto_nautic_device_fetch (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	return suunto_nautic_device_short_fetch (abstract, path, response);
+}
+
+dc_status_t
+suunto_nautic_device_fetch_raw (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	// Diagnostic: return the raw DATA frame exactly as the watch sends it
+	// (the whole A5 05 .. packet, no opcode/status validation), so a tester
+	// can export whatever came back even when parsing fails. This mirrors the
+	// real listing path: /Logbook/Entries answers only the SHORT (no-range)
+	// 0x0D fetch and replies with a single complete status-200 frame. The
+	// ranged/paginated fetch is for /Summary only -- /Entries rejects it, which
+	// is why routing this diagnostic through paginated_fetch returned a
+	// non-100/200 status (DC_STATUS_PROTOCOL). The earlier "size varied per
+	// tap" was the Suunto app running concurrently and racing on the BLE link;
+	// with that app closed the short fetch returns a clean, complete frame.
+	return suunto_nautic_short_fetch_frame (abstract, path, response, 1);
+}
+
+dc_status_t
 suunto_nautic_device_download_summary (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *summary)
 {
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || summary == NULL)
@@ -859,7 +889,7 @@ suunto_nautic_device_download_summary (dc_device_t *abstract, const char *logboo
 	return suunto_nautic_device_paginated_fetch (abstract, path, summary);
 }
 
-static dc_status_t
+dc_status_t
 suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *raw)
 {
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || raw == NULL)
@@ -927,8 +957,9 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 // (end > start, within a day), both 4-aligned little-endian uint32s in the
 // dive-ID window; a lone in-range value with no paired end is a header/misc
 // field (the response's own "current time"), not a dive. Writes up to max_ids
-// ids and returns the count.
-static unsigned int
+// ids and returns the count. Both device_foreach and suunto_nautic_device_list
+// share this one entry parser.
+unsigned int
 suunto_nautic_extract_entry_ids (const unsigned char *data, size_t size,
 	unsigned int *ids, unsigned int max_ids)
 {
@@ -952,6 +983,52 @@ suunto_nautic_extract_entry_ids (const unsigned char *data, size_t size,
 		ids[b + 1] = key;
 	}
 	return count;
+}
+
+// Public: list dive ids (each a UNIX-timestamp LogId) newest-first, without
+// downloading the dives. Writes the ids as packed little-endian uint32 into
+// `out`; the caller reads them as a plain array (no protocol knowledge needed).
+dc_status_t
+suunto_nautic_device_list (dc_device_t *abstract, dc_buffer_t *out)
+{
+	if (out == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_buffer_t *entries = dc_buffer_new (0);
+	if (entries == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	dc_status_t status = suunto_nautic_device_short_fetch (abstract, "/Logbook/Entries", entries);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (entries);
+		return status;
+	}
+
+	const unsigned char *data = dc_buffer_get_data (entries);
+	size_t size = dc_buffer_get_size (entries);
+	size_t max_ids = size / 4 + 1;
+	unsigned int *ids = (unsigned int *) malloc (max_ids * sizeof (unsigned int));
+	if (ids == NULL) {
+		dc_buffer_free (entries);
+		return DC_STATUS_NOMEMORY;
+	}
+	unsigned int count = suunto_nautic_extract_entry_ids (data, size, ids, (unsigned int) max_ids);
+	dc_buffer_free (entries);
+
+	dc_buffer_clear (out);
+	for (unsigned int i = 0; i < count; i++) {
+		unsigned char le[4];
+		le[0] = ids[i] & 0xFF;
+		le[1] = (ids[i] >> 8) & 0xFF;
+		le[2] = (ids[i] >> 16) & 0xFF;
+		le[3] = (ids[i] >> 24) & 0xFF;
+		if (!dc_buffer_append (out, le, sizeof (le))) {
+			free (ids);
+			return DC_STATUS_NOMEMORY;
+		}
+	}
+	free (ids);
+	return DC_STATUS_SUCCESS;
 }
 
 static dc_status_t
