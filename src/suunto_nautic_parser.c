@@ -121,12 +121,24 @@
 // gives low > high.
 #define SUMMARY_GF_LOW   0x35 // uint16 LE, %
 #define SUMMARY_GF_HIGH  0x33 // uint16 LE, %
-#define SUMMARY_GAS_BASE 0xC7 // first gas; 4 bytes each: id, O2%, He%, type
+// Gas/cylinder records: an array starting at SUMMARY_GAS_BASE, one 45-byte
+// record per configured gas. The record index equals the cylinder slot /
+// GasNumber, so tank i uses gas i. Within a record: O2% at +1, He% at +2,
+// PO2-max (float32 LE, bar) at +5, cylinder water capacity (float32 LE, m^3)
+// at +9. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
+// transmitters -- issue #29/#33/#34); a lone gas dive stops at the first
+// implausible slot, as before.
+#define SUMMARY_GAS_BASE   0xC7
+#define SUMMARY_GAS_STRIDE 45
+#define SUMMARY_GAS_O2     1  // uint8, %
+#define SUMMARY_GAS_HE     2  // uint8, %
+#define SUMMARY_GAS_VOLUME 9  // float32 LE, m^3
 
 typedef struct suunto_nautic_tank_t {
 	unsigned int used;
 	double beginpressure; // bar
 	double endpressure;   // bar
+	unsigned int gasmix;  // gas index (== cylinder slot / GasNumber)
 } suunto_nautic_tank_t;
 
 typedef struct suunto_nautic_parser_t {
@@ -149,6 +161,7 @@ typedef struct suunto_nautic_parser_t {
 	// From the /Summary SBEM section appended after the profile, if present.
 	unsigned int ngasmixes;
 	dc_gasmix_t gasmix[MAX_GASMIXES];
+	double gasvolume[MAX_GASMIXES]; // cylinder water capacity, litres (0 = unknown)
 	unsigned int have_decomodel;
 	dc_decomodel_t decomodel;
 } suunto_nautic_parser_t;
@@ -298,17 +311,25 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 	}
 
 	for (unsigned int i = 0; i < MAX_GASMIXES; i++) {
-		size_t base = SUMMARY_GAS_BASE + (size_t) i * 4;
-		if (base + 3 > size)
+		size_t base = SUMMARY_GAS_BASE + (size_t) i * SUMMARY_GAS_STRIDE;
+		if (base + SUMMARY_GAS_O2 >= size)
 			break;
-		unsigned int o2 = sbem[base + 1];
-		unsigned int he = sbem[base + 2];
+		unsigned int o2 = sbem[base + SUMMARY_GAS_O2];
+		unsigned int he = sbem[base + SUMMARY_GAS_HE];
 		if (o2 < 1 || o2 > 100 || he > 100 || o2 + he > 100)
 			break; // unused/implausible slot -- stop
-		parser->gasmix[parser->ngasmixes].oxygen = o2 / 100.0;
-		parser->gasmix[parser->ngasmixes].helium = he / 100.0;
-		parser->gasmix[parser->ngasmixes].nitrogen = 1.0 - (o2 + he) / 100.0;
-		parser->gasmix[parser->ngasmixes].usage = DC_USAGE_NONE;
+		unsigned int g = parser->ngasmixes;
+		parser->gasmix[g].oxygen = o2 / 100.0;
+		parser->gasmix[g].helium = he / 100.0;
+		parser->gasmix[g].nitrogen = 1.0 - (o2 + he) / 100.0;
+		parser->gasmix[g].usage = DC_USAGE_NONE;
+		// Per-gas cylinder water capacity (float32 m^3) -> litres, when the
+		// record's volume field is present and physically sane.
+		if (base + SUMMARY_GAS_VOLUME + 4 <= size) {
+			double vol_m3 = array_float_le (sbem + base + SUMMARY_GAS_VOLUME);
+			if (vol_m3 > 0.0 && vol_m3 < 1.0)
+				parser->gasvolume[g] = vol_m3 * 1000.0;
+		}
 		parser->ngasmixes++;
 	}
 }
@@ -531,6 +552,9 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 								continue;
 							tankmap[key] = (int) ntanks;
 							tank[ntanks].used = 1;
+							// Cylinder slot index == GasNumber, so this tank
+							// breathes gas i (linked to gasmix[i] below).
+							tank[ntanks].gasmix = i;
 							// Begin from the first observed reading (the deferred one for Pressure2).
 							tank[ntanks].beginpressure = (field == 1 && p2_first[i] >= 0)
 								? p2_first[i] / 100000.0 : bar;
@@ -771,6 +795,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->ngasmixes = 0;
 	parser->have_decomodel = 0;
 	memset (parser->gasmix, 0, sizeof (parser->gasmix));
+	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
 	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
 	if (profile_size < abstract->size) {
 		suunto_nautic_parse_summary (parser, abstract->data + profile_size,
@@ -855,6 +880,18 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		tank->endpressure = parser->tank[flags].endpressure;
 		tank->gasmix = DC_GASMIX_UNKNOWN;
 		tank->usage = DC_USAGE_NONE;
+		// Link the tank to its gas (slot index) and expose the per-gas
+		// cylinder size from the /Summary when both are known.
+		{
+			unsigned int gi = parser->tank[flags].gasmix;
+			if (gi < parser->ngasmixes) {
+				tank->gasmix = gi;
+				if (parser->gasvolume[gi] > 0.0) {
+					tank->type = DC_TANKVOLUME_METRIC;
+					tank->volume = parser->gasvolume[gi];
+				}
+			}
+		}
 		break;
 	case DC_FIELD_LOCATION:
 		if (!parser->have_location)
