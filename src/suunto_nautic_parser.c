@@ -59,7 +59,11 @@
 #define SBEM_MAGIC_SIZE 8
 
 #define CHUNK_TIMELINE_BASE   0x01
-#define CHUNK_ACTIVITY        0x08
+#define CHUNK_ACTIVITY        0x08 // [timeDelta:2][sportId:1][customModeId: ascii]
+// Suunto sport ids seen on the Nautic/Ocean, from the app's ActivityType:
+// 51 = scuba, 61 = free diving, 62 = mermaiding. Only the last two are apnea.
+#define SPORT_ID_FREEDIVE     61
+#define SPORT_ID_MERMAIDING   62
 #define CHUNK_GPS             0x0B
 #define CHUNK_GPS_ACCURACY    0x0E // [timeDelta:2][dEHPE:int8][dEVPE:int8][?:2]
 #define CHUNK_BATTERY         0x14 // [timeDelta:2][current:int16][voltage:uint16 mV][charge:uint8 %]
@@ -158,6 +162,7 @@ typedef struct suunto_nautic_parser_t {
 	double atmospheric; // bar
 	unsigned int have_datetime;
 	dc_ticks_t datetime; // dive start, UNIX seconds
+	dc_divemode_t divemode; // from the CHUNK_ACTIVITY sport id; OC unless apnea
 	// From the /Summary SBEM section appended after the profile, if present.
 	unsigned int ngasmixes;
 	dc_gasmix_t gasmix[MAX_GASMIXES];
@@ -457,6 +462,12 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	double atmospheric = 0.0;
 
 	unsigned int have_datetime = 0;
+
+	// Open circuit unless a CHUNK_ACTIVITY sport id says the dive was apnea.
+	// The Nautic/Ocean are recreational OC computers (no CCR/SCR), and with no
+	// activity chunk at all OC is the right default -- far better than the
+	// dc_divemode_t zero value (freedive) a missing field leaves behind.
+	dc_divemode_t divemode = DC_DIVEMODE_OC;
 
 	// GPS horizontal/vertical position error, int8-delta-accumulated (chunk 0x0E).
 	int ehpe = 0, evpe = 0;
@@ -774,6 +785,15 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			// SurfacePressure (offset 2) is used; last one logged wins.
 			have_atmospheric = 1;
 			atmospheric = array_float_le (chunk.data + 2) / 100000.0;
+		} else if (chunk.id == CHUNK_ACTIVITY && chunk.size >= 3) {
+			// [timeDelta:2][sportId:1][customModeId: ascii]. The sport id
+			// is the app's ActivityType; 61/62 are the apnea sports, every
+			// other diving id is open circuit.
+			unsigned int sport = chunk.data[2];
+			if (sport == SPORT_ID_FREEDIVE || sport == SPORT_ID_MERMAIDING)
+				divemode = DC_DIVEMODE_FREEDIVE;
+			else
+				divemode = DC_DIVEMODE_OC;
 		}
 	}
 
@@ -799,6 +819,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->have_atmospheric = have_atmospheric;
 	parser->atmospheric = atmospheric;
 	parser->have_datetime = have_datetime;
+	parser->divemode = divemode;
 
 	// Gradient factors and gas mixes from the appended /Summary section.
 	parser->ngasmixes = 0;
@@ -924,6 +945,9 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		if (!parser->have_decomodel)
 			return DC_STATUS_UNSUPPORTED;
 		*((dc_decomodel_t *) value) = parser->decomodel;
+		break;
+	case DC_FIELD_DIVEMODE:
+		*((dc_divemode_t *) value) = parser->divemode;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
