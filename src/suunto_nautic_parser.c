@@ -29,12 +29,13 @@
  *   immediately, before the value.
  *
  * Decoded chunks: 0x12 (1Hz absolute pressure / temperature), 0x16
- * (depth, cylinder pressures, NDL, time-to-surface), 0x17 (surface
- * pressure), 0x0B (GPS), plus the dynamically-assigned dive-event
- * subgroups. Chunks 0x08 (activity), 0x0E (satellite info) and 0x14
- * (battery) have fixed lengths that are used for resync (see
- * suunto_nautic_sbem_fixed_length) but map to no dc_field/dc_sample and
- * are not otherwise decoded. Chunks 0x23/0x24 are raw accelerometer /
+ * (depth, cylinder pressures, gas time remaining, NDL, time-to-surface),
+ * 0x17 (surface pressure), 0x0B (GPS), 0x0F (heart rate, Ocean only),
+ * 0x08 (activity -> dive mode), plus the dynamically-assigned dive-event
+ * subgroups. Chunks 0x0E (satellite
+ * info) and 0x14 (battery) have fixed lengths that are used for resync
+ * (see suunto_nautic_sbem_fixed_length) but map to no dc_field/dc_sample
+ * and are not otherwise decoded. Chunks 0x23/0x24 are raw accelerometer /
  * gyroscope dumps for client-side dead reckoning, emitted through
  * DC_SAMPLE_VENDOR. Unknown chunk ids are skipped, so extending the
  * decoder is additive.
@@ -59,9 +60,14 @@
 #define SBEM_MAGIC_SIZE 8
 
 #define CHUNK_TIMELINE_BASE   0x01
-#define CHUNK_ACTIVITY        0x08
+#define CHUNK_ACTIVITY        0x08 // [timeDelta:2][sportId:1][customModeId: ascii]
+// Suunto sport ids seen on the Nautic/Ocean, from the app's ActivityType:
+// 51 = scuba, 61 = free diving, 62 = mermaiding. Only the last two are apnea.
+#define SPORT_ID_FREEDIVE     61
+#define SPORT_ID_MERMAIDING   62
 #define CHUNK_GPS             0x0B
 #define CHUNK_GPS_ACCURACY    0x0E // [timeDelta:2][dEHPE:int8][dEVPE:int8][?:2]
+#define CHUNK_HEARTRATE       0x0F // [timeDelta:2][hr:uint8 bpm] -- Ocean wrist HR only
 #define CHUNK_BATTERY         0x14 // [timeDelta:2][current:int16][voltage:uint16 mV][charge:uint8 %]
 // High-rate IMU: [timeDelta:2][algoTS:uint32][accel/gyro/mag X,Y,Z:int16], a
 // 24-byte payload. The chunk id is FIRMWARE-DEPENDENT: 0x23 on the 195-byte
@@ -148,6 +154,7 @@ typedef struct suunto_nautic_parser_t {
 	double maxdepth;       // meters
 	double avgdepth;       // meters
 	unsigned int have_temperature;
+	double temperature_surface; // first (surface) reading
 	double temperature_minimum;
 	double temperature_maximum;
 	unsigned int ntanks;
@@ -158,6 +165,7 @@ typedef struct suunto_nautic_parser_t {
 	double atmospheric; // bar
 	unsigned int have_datetime;
 	dc_ticks_t datetime; // dive start, UNIX seconds
+	dc_divemode_t divemode; // from the CHUNK_ACTIVITY sport id; OC unless apnea
 	// From the /Summary SBEM section appended after the profile, if present.
 	unsigned int ngasmixes;
 	dc_gasmix_t gasmix[MAX_GASMIXES];
@@ -430,6 +438,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	unsigned int depth_count = 0;
 
 	unsigned int have_temperature = 0;
+	double temperature_surface = 0.0;
 	double temperature_minimum = 0.0;
 	double temperature_maximum = 0.0;
 
@@ -458,6 +467,12 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 	unsigned int have_datetime = 0;
 
+	// Open circuit unless a CHUNK_ACTIVITY sport id says the dive was apnea.
+	// The Nautic/Ocean are recreational OC computers (no CCR/SCR), and with no
+	// activity chunk at all OC is the right default -- far better than the
+	// dc_divemode_t zero value (freedive) a missing field leaves behind.
+	dc_divemode_t divemode = DC_DIVEMODE_OC;
+
 	// GPS horizontal/vertical position error, int8-delta-accumulated (chunk 0x0E).
 	int ehpe = 0, evpe = 0;
 
@@ -472,6 +487,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			double temperature = array_uint16_le (chunk.data + 16) / 100.0 - 273.15;
 
 			if (!have_temperature) {
+				// The first reading is taken at/near the surface at dive start.
+				temperature_surface = temperature;
 				temperature_minimum = temperature_maximum = temperature;
 				have_temperature = 1;
 			} else {
@@ -533,6 +550,23 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 						break; // full tank record doesn't fit this chunk
 					if (chunk.data[base] != i)
 						break; // not a real tank slot
+
+					// Gas time remaining: uint32 LE seconds at record +10, for
+					// the primary cylinder. 0xFFFFFFFF means not computed (no
+					// AI, or not enough data yet). This is the app's
+					// Cylinders[].GasTime; exposed as RBT minutes, the same way
+					// suunto_eonsteel does.
+					if (i == 0 && callback) {
+						unsigned int gastime = array_uint32_le (chunk.data + base + 10);
+						if (gastime != 0xFFFFFFFF && gastime != 0) {
+							dc_sample_value_t sample = {0};
+							sample.time = (unsigned int) time_ms;
+							callback (DC_SAMPLE_TIME, &sample, userdata);
+							sample.rbt = gastime / 60;
+							callback (DC_SAMPLE_RBT, &sample, userdata);
+						}
+					}
+
 					for (unsigned int field = 0; field < 2; field++) {
 						unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2 + field * 4);
 						if (pressure_pa == 0)
@@ -700,15 +734,34 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_GAS_SWITCH && chunk.size >= 4) {
-			// [timeDelta:2][gasnumber:int16 LE].
-			if (callback) {
+			// [timeDelta:2][gasnumber:int16 LE] -- 0-based, and equal to the
+			// cylinder slot / gas-mix index.
+			int gasnum = (int16_t) array_uint16_le (chunk.data + 2);
+			if (gasnum >= 0 && callback) {
 				dc_sample_value_t sample = {0};
 				sample.time = (unsigned int) time_ms;
 				callback (DC_SAMPLE_TIME, &sample, userdata);
+				// Modern channel: the active gas-mix index.
+				sample.gasmix = (unsigned int) gasnum;
+				callback (DC_SAMPLE_GASMIX, &sample, userdata);
+				// Legacy channel, for consumers that only read events.
 				sample.event.type = SAMPLE_EVENT_GASCHANGE;
 				sample.event.flags = SAMPLE_FLAGS_BEGIN;
-				sample.event.value = (unsigned int) (int16_t) array_uint16_le (chunk.data + 2);
+				sample.event.value = (unsigned int) gasnum;
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
+			}
+		} else if (chunk.id == CHUNK_HEARTRATE && chunk.size >= 3) {
+			// [timeDelta:2][hr:uint8 bpm]. Optical wrist HR, present only on
+			// the Suunto Ocean (the Nautic / Nautic S have no HR sensor, so
+			// the chunk never appears there). Byte-exact against the app
+			// export's per-sample HR on a real Ocean dive (66-113 bpm).
+			unsigned int hr = chunk.data[2];
+			if (hr && callback) {
+				dc_sample_value_t sample = {0};
+				sample.time = (unsigned int) time_ms;
+				callback (DC_SAMPLE_TIME, &sample, userdata);
+				sample.heartbeat = hr;
+				callback (DC_SAMPLE_HEARTBEAT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_BATTERY && chunk.size >= 7) {
 			// Battery telemetry -> DC_SAMPLE_VENDOR kind 1.
@@ -774,6 +827,15 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			// SurfacePressure (offset 2) is used; last one logged wins.
 			have_atmospheric = 1;
 			atmospheric = array_float_le (chunk.data + 2) / 100000.0;
+		} else if (chunk.id == CHUNK_ACTIVITY && chunk.size >= 3) {
+			// [timeDelta:2][sportId:1][customModeId: ascii]. The sport id
+			// is the app's ActivityType; 61/62 are the apnea sports, every
+			// other diving id is open circuit.
+			unsigned int sport = chunk.data[2];
+			if (sport == SPORT_ID_FREEDIVE || sport == SPORT_ID_MERMAIDING)
+				divemode = DC_DIVEMODE_FREEDIVE;
+			else
+				divemode = DC_DIVEMODE_OC;
 		}
 	}
 
@@ -790,6 +852,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->maxdepth = maxdepth;
 	parser->avgdepth = depth_count ? depth_sum / depth_count : 0.0;
 	parser->have_temperature = have_temperature;
+	parser->temperature_surface = temperature_surface;
 	parser->temperature_minimum = temperature_minimum;
 	parser->temperature_maximum = temperature_maximum;
 	parser->ntanks = ntanks;
@@ -799,6 +862,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->have_atmospheric = have_atmospheric;
 	parser->atmospheric = atmospheric;
 	parser->have_datetime = have_datetime;
+	parser->divemode = divemode;
 
 	// Gradient factors and gas mixes from the appended /Summary section.
 	parser->ngasmixes = 0;
@@ -866,6 +930,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 	case DC_FIELD_AVGDEPTH:
 		*((double *) value) = parser->avgdepth;
 		break;
+	case DC_FIELD_TEMPERATURE_SURFACE:
+		if (!parser->have_temperature)
+			return DC_STATUS_UNSUPPORTED;
+		*((double *) value) = parser->temperature_surface;
+		break;
 	case DC_FIELD_TEMPERATURE_MINIMUM:
 		if (!parser->have_temperature)
 			return DC_STATUS_UNSUPPORTED;
@@ -924,6 +993,9 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		if (!parser->have_decomodel)
 			return DC_STATUS_UNSUPPORTED;
 		*((dc_decomodel_t *) value) = parser->decomodel;
+		break;
+	case DC_FIELD_DIVEMODE:
+		*((dc_divemode_t *) value) = parser->divemode;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
