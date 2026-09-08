@@ -29,12 +29,12 @@
  *   immediately, before the value.
  *
  * Decoded chunks: 0x12 (1Hz absolute pressure / temperature), 0x16
- * (depth, cylinder pressures, NDL, time-to-surface), 0x17 (surface
- * pressure), 0x0B (GPS), plus the dynamically-assigned dive-event
- * subgroups. Chunks 0x08 (activity), 0x0E (satellite info) and 0x14
- * (battery) have fixed lengths that are used for resync (see
- * suunto_nautic_sbem_fixed_length) but map to no dc_field/dc_sample and
- * are not otherwise decoded. Chunks 0x23/0x24 are raw accelerometer /
+ * (depth, cylinder pressures, gas time remaining, NDL, time-to-surface),
+ * 0x17 (surface pressure), 0x0B (GPS), 0x08 (activity -> dive mode), plus
+ * the dynamically-assigned dive-event subgroups. Chunks 0x0E (satellite
+ * info) and 0x14 (battery) have fixed lengths that are used for resync
+ * (see suunto_nautic_sbem_fixed_length) but map to no dc_field/dc_sample
+ * and are not otherwise decoded. Chunks 0x23/0x24 are raw accelerometer /
  * gyroscope dumps for client-side dead reckoning, emitted through
  * DC_SAMPLE_VENDOR. Unknown chunk ids are skipped, so extending the
  * decoder is additive.
@@ -544,6 +544,23 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 						break; // full tank record doesn't fit this chunk
 					if (chunk.data[base] != i)
 						break; // not a real tank slot
+
+					// Gas time remaining: uint32 LE seconds at record +10, for
+					// the primary cylinder. 0xFFFFFFFF means not computed (no
+					// AI, or not enough data yet). This is the app's
+					// Cylinders[].GasTime; exposed as RBT minutes, the same way
+					// suunto_eonsteel does.
+					if (i == 0 && callback) {
+						unsigned int gastime = array_uint32_le (chunk.data + base + 10);
+						if (gastime != 0xFFFFFFFF && gastime != 0) {
+							dc_sample_value_t sample = {0};
+							sample.time = (unsigned int) time_ms;
+							callback (DC_SAMPLE_TIME, &sample, userdata);
+							sample.rbt = gastime / 60;
+							callback (DC_SAMPLE_RBT, &sample, userdata);
+						}
+					}
+
 					for (unsigned int field = 0; field < 2; field++) {
 						unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2 + field * 4);
 						if (pressure_pa == 0)
