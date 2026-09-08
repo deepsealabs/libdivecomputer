@@ -154,6 +154,7 @@ typedef struct suunto_nautic_parser_t {
 	double maxdepth;       // meters
 	double avgdepth;       // meters
 	unsigned int have_temperature;
+	double temperature_surface; // first (surface) reading
 	double temperature_minimum;
 	double temperature_maximum;
 	unsigned int ntanks;
@@ -437,6 +438,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	unsigned int depth_count = 0;
 
 	unsigned int have_temperature = 0;
+	double temperature_surface = 0.0;
 	double temperature_minimum = 0.0;
 	double temperature_maximum = 0.0;
 
@@ -485,6 +487,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			double temperature = array_uint16_le (chunk.data + 16) / 100.0 - 273.15;
 
 			if (!have_temperature) {
+				// The first reading is taken at/near the surface at dive start.
+				temperature_surface = temperature;
 				temperature_minimum = temperature_maximum = temperature;
 				have_temperature = 1;
 			} else {
@@ -730,14 +734,20 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_GAS_SWITCH && chunk.size >= 4) {
-			// [timeDelta:2][gasnumber:int16 LE].
-			if (callback) {
+			// [timeDelta:2][gasnumber:int16 LE] -- 0-based, and equal to the
+			// cylinder slot / gas-mix index.
+			int gasnum = (int16_t) array_uint16_le (chunk.data + 2);
+			if (gasnum >= 0 && callback) {
 				dc_sample_value_t sample = {0};
 				sample.time = (unsigned int) time_ms;
 				callback (DC_SAMPLE_TIME, &sample, userdata);
+				// Modern channel: the active gas-mix index.
+				sample.gasmix = (unsigned int) gasnum;
+				callback (DC_SAMPLE_GASMIX, &sample, userdata);
+				// Legacy channel, for consumers that only read events.
 				sample.event.type = SAMPLE_EVENT_GASCHANGE;
 				sample.event.flags = SAMPLE_FLAGS_BEGIN;
-				sample.event.value = (unsigned int) (int16_t) array_uint16_le (chunk.data + 2);
+				sample.event.value = (unsigned int) gasnum;
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
 		} else if (chunk.id == CHUNK_HEARTRATE && chunk.size >= 3) {
@@ -842,6 +852,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->maxdepth = maxdepth;
 	parser->avgdepth = depth_count ? depth_sum / depth_count : 0.0;
 	parser->have_temperature = have_temperature;
+	parser->temperature_surface = temperature_surface;
 	parser->temperature_minimum = temperature_minimum;
 	parser->temperature_maximum = temperature_maximum;
 	parser->ntanks = ntanks;
@@ -918,6 +929,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		break;
 	case DC_FIELD_AVGDEPTH:
 		*((double *) value) = parser->avgdepth;
+		break;
+	case DC_FIELD_TEMPERATURE_SURFACE:
+		if (!parser->have_temperature)
+			return DC_STATUS_UNSUPPORTED;
+		*((double *) value) = parser->temperature_surface;
 		break;
 	case DC_FIELD_TEMPERATURE_MINIMUM:
 		if (!parser->have_temperature)
