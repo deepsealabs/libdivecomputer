@@ -1255,14 +1255,18 @@ suunto_nautic_device_list (dc_device_t *abstract, dc_buffer_t *out)
 // is known (non-zero) the download is checked against it: the listed size is
 // compressed /Data + /Summary data bytes, exactly. A mismatch is retried once
 // and then reported through `*incomplete`, with the dive left in `raw`.
+// `*unreadable` is set on a failure where the transfer completed and matched
+// the listing but holds no decodable dive (an empty/aborted logbook entry):
+// downloading it again cannot help. Any other failure may succeed later.
 static dc_status_t
 suunto_nautic_device_download_dive (dc_device_t *abstract, const char *logbook_id, unsigned int listed_size,
-	dc_buffer_t *raw, int *incomplete)
+	dc_buffer_t *raw, int *incomplete, int *unreadable)
 {
 	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
 	dc_status_t status = DC_STATUS_SUCCESS;
 
 	*incomplete = 0;
+	*unreadable = 0;
 
 	char path[128];
 	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Data", logbook_id);
@@ -1322,6 +1326,7 @@ suunto_nautic_device_download_dive (dc_device_t *abstract, const char *logbook_i
 		dc_buffer_get_data (compressed), dc_buffer_get_size (compressed), raw);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to decompress the logbook entry.");
+		*unreadable = status == DC_STATUS_DATAFORMAT && !*incomplete;
 		goto done;
 	}
 
@@ -1329,6 +1334,7 @@ suunto_nautic_device_download_dive (dc_device_t *abstract, const char *logbook_i
 		memcmp (dc_buffer_get_data (raw), SBEM_MAGIC, sizeof (SBEM_MAGIC)) != 0) {
 		ERROR (abstract->context, "Unexpected magic in the decompressed data.");
 		status = DC_STATUS_DATAFORMAT;
+		*unreadable = !*incomplete;
 		goto done;
 	}
 
@@ -1368,8 +1374,8 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 		suunto_nautic_entries_free (&entries);
 	}
 
-	int incomplete = 0;
-	dc_status_t status = suunto_nautic_device_download_dive (abstract, logbook_id, listed_size, raw, &incomplete);
+	int incomplete = 0, unreadable = 0;
+	dc_status_t status = suunto_nautic_device_download_dive (abstract, logbook_id, listed_size, raw, &incomplete, &unreadable);
 	if (status == DC_STATUS_SUCCESS && incomplete)
 		return DC_STATUS_DATAFORMAT;
 	return status;
@@ -1696,16 +1702,21 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 			continue;
 
 		dc_buffer_clear (raw);
-		int incomplete = 0;
-		status = suunto_nautic_device_download_dive (abstract, logbook_id, entries.sizes[i], raw, &incomplete);
-		if (status != DC_STATUS_SUCCESS) {
-			// A logbook can contain empty/aborted entries (a zero-length
-			// session is listed in /Logbook/Entries but downloads to no
-			// profile data and fails the SBEM magic check). Skip with a
-			// warning rather than aborting the whole enumeration.
-			WARNING (abstract->context, "Skipping logbook entry %s (download failed, likely an empty/aborted dive).", logbook_id);
+		int incomplete = 0, unreadable = 0;
+		status = suunto_nautic_device_download_dive (abstract, logbook_id, entries.sizes[i], raw, &incomplete, &unreadable);
+		if (status != DC_STATUS_SUCCESS && unreadable) {
+			// An empty/aborted entry: listed, but with nothing to decode.
+			WARNING (abstract->context, "Skipping logbook entry %s (no decodable dive data).", logbook_id);
 			status = DC_STATUS_SUCCESS;
 			continue;
+		}
+		if (status != DC_STATUS_SUCCESS) {
+			// Stop at the first dive that may download later: the host takes
+			// its fingerprint from the newest dive, so carrying on past a gap
+			// would mark this dive as synced.
+			ERROR (abstract->context, "Failed to download logbook entry %s; it and any older new dives are left for the next sync.",
+				logbook_id);
+			break;
 		}
 
 		// Delivered anyway: skipping it would move the fingerprint past a
@@ -1724,5 +1735,5 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	dc_buffer_free (raw);
 	suunto_nautic_entries_free (&entries);
 
-	return DC_STATUS_SUCCESS;
+	return status;
 }
