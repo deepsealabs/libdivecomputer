@@ -33,10 +33,12 @@
  *     is used for all requests.
  *
  * Dive download:
- *   - GET <entry>/Data (opcode 0x0A) -> ack -> two stream-fetch triggers
- *     -> chunk stream (opcode 0x01, repeated). The chunk stream is
- *     unacknowledged and continuous; the host buffers until a 2.0s
- *     silence timeout, then closes it with STREAM_STOP (opcode 0x11).
+ *   - GET <entry>/Data (opcode 0x0A) -> ack carrying the handle bound to
+ *     that dive -> subscribe on that handle (0x10) -> chunk stream (opcode
+ *     0x01, repeated). The chunk stream is unacknowledged and continuous;
+ *     the host buffers until a 2.0s silence timeout, then closes it with
+ *     STREAM_STOP (opcode 0x11) and releases the handle (opcode 0x0B), as
+ *     a still-bound handle makes the next GET of /Data bind another slot.
  *   - Each 0x01 frame carries a 28-byte MDS header: payload size is a
  *     u16 LE at offset 20, payload starts at offset 28.
  *   - Payloads are Heatshrink-compressed (LZSS variant, see
