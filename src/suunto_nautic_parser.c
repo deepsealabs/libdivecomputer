@@ -51,6 +51,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <math.h>
 
 #include "suunto_nautic.h"
 #include "context-private.h"
@@ -139,6 +140,11 @@
 #define SUMMARY_GAS_O2     1  // uint8, %
 #define SUMMARY_GAS_HE     2  // uint8, %
 #define SUMMARY_GAS_VOLUME 9  // float32 LE, m^3
+// The dive record, the last /Summary record long enough to hold these, carries
+// the watch's own dive time and maximum depth (the app's DiveTime and
+// Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries.
+#define SUMMARY_DIVE_DIVETIME 321 // float32 LE, s, fractional
+#define SUMMARY_DIVE_MAXDEPTH 330 // float32 LE, m
 
 typedef struct suunto_nautic_tank_t {
 	unsigned int used;
@@ -298,6 +304,32 @@ suunto_nautic_find_summary (const unsigned char *data, size_t size)
 			return i;
 	}
 	return size;
+}
+
+// The /Summary's dive record: its records are plain [id][len] TLVs (the
+// profile's fixed-length table doesn't apply), ending in trailing bytes that
+// don't form a whole record.
+static const unsigned char *
+suunto_nautic_summary_dive_record (const unsigned char *sbem, size_t size)
+{
+	const unsigned char *record = NULL;
+	size_t pos = SBEM_MAGIC_SIZE;
+	while (pos + 2 <= size) {
+		size_t length = sbem[pos + 1];
+		size_t header = 2;
+		if (length == 255) {
+			if (pos + 6 > size)
+				break;
+			length = array_uint32_le (sbem + pos + 2);
+			header = 6;
+		}
+		if (length > size - pos - header)
+			break;
+		if (length >= SUMMARY_DIVE_MAXDEPTH + 4)
+			record = sbem + pos + header;
+		pos += header + length;
+	}
+	return record;
 }
 
 // Parse gradient factors and gas mixes from the /Summary section, whose
@@ -845,10 +877,11 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 	// Dive time = total time in the Diving state (seconds). Fall back to the
 	// full elapsed time if no DiveState markers were seen.
+	// Truncated, as the app shows it: 4680.5 s is 78:00.
 	if (total_dive_ms > 0)
-		parser->divetime = (unsigned int) ((total_dive_ms + 500) / 1000);
+		parser->divetime = (unsigned int) (total_dive_ms / 1000);
 	else
-		parser->divetime = (unsigned int) ((time_ms + 500) / 1000);
+		parser->divetime = time_ms > 0 ? (unsigned int) (time_ms / 1000) : 0;
 	parser->maxdepth = maxdepth;
 	parser->avgdepth = depth_count ? depth_sum / depth_count : 0.0;
 	parser->have_temperature = have_temperature;
@@ -871,8 +904,25 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
 	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
 	if (profile_size < abstract->size) {
-		suunto_nautic_parse_summary (parser, abstract->data + profile_size,
-			abstract->size - profile_size);
+		const unsigned char *sbem = abstract->data + profile_size;
+		size_t sbem_size = abstract->size - profile_size;
+		suunto_nautic_parse_summary (parser, sbem, sbem_size);
+
+		// The watch's maximum is deeper than any logged sample (the app shows
+		// it). Trusted only on a record whose dive time agrees with the
+		// profile's, and when it is close to the sampled maximum.
+		const unsigned char *record = suunto_nautic_summary_dive_record (sbem, sbem_size);
+		if (record && parser->divetime > 0) {
+			double divetime = array_float_le (record + SUMMARY_DIVE_DIVETIME);
+			double depth = array_float_le (record + SUMMARY_DIVE_MAXDEPTH);
+			double computed = parser->divetime;
+			double tolerance = computed * 0.1 > 30.0 ? computed * 0.1 : 30.0;
+			if (divetime > 0.0 && divetime < 86400.0 && fabs (divetime - computed) <= tolerance) {
+				parser->divetime = (unsigned int) divetime;
+				if (maxdepth > 0.0 && depth >= maxdepth - 0.5 && depth <= maxdepth + 3.0)
+					parser->maxdepth = depth;
+			}
+		}
 	}
 
 	parser->cached = 1;

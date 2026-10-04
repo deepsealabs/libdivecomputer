@@ -115,6 +115,7 @@ suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_b
  * Whiteboard-encoded as [type:u16 LE][value...]. wait_notification returns the
  * next pushed value on any subscribed handle, or DC_STATUS_TIMEOUT after
  * `timeout` milliseconds. Not valid while a dive download is in progress.
+ * unsubscribe also releases the handle when it is a per-id slot.
  */
 dc_status_t
 suunto_nautic_device_subscribe (dc_device_t *device, const char *path, unsigned char handle[3], dc_buffer_t *value);

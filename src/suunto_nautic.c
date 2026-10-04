@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 #include "suunto_nautic.h"
 #include "context-private.h"
@@ -58,11 +59,14 @@
 
 // A GET of a per-id path (/Logbook/byId/<id>/...) binds the id to one of the
 // resource's handle slots, [00|10 24 <resource>], until a RELEASE frees it; a
-// second GET while the 00 slot is still bound gets the 10 slot. Static paths
-// answer with an F0 handle and the unknown-path handle is FF FF FF; neither is
-// released.
-#define RPC_HANDLE_STATIC  0xF0
-#define RPC_HANDLE_UNKNOWN 0xFF
+// second GET while the 00 slot is still bound gets the 10 slot. Static paths,
+// the value resources included (/Logbook/UnsynchronisedLogs = F0 24 0D,
+// /Sync/BusyState = F0 4C 00 in the Suunto app captures), answer with an F0
+// handle and the unknown-path handle is FF FF FF; neither is released.
+#define RPC_HANDLE_SLOT     0x00
+#define RPC_HANDLE_SLOT_ALT 0x10
+#define RPC_HANDLE_STATIC   0xF0
+#define RPC_HANDLE_UNKNOWN  0xFF
 
 // Fetch parameter types (Whiteboard type ids): the paged /Summary offset is an
 // int32, /Logbook/Entries' StartAfterId a uint32.
@@ -138,6 +142,11 @@
 #define HEATSHRINK_INPUT_BUFFER_SIZE 256
 
 static const unsigned char SBEM_MAGIC[8] = {'S','B','E','M','0','1','0','3'};
+
+// Message ids carry on from the previous connection instead of restarting at
+// 1, as the Suunto app's do: after a dropped link the watch can keep the old
+// session, and a request reusing one of its recent ids goes unanswered.
+static unsigned int g_suunto_nautic_next_msgid = 0;
 
 typedef struct suunto_nautic_device_t {
 	dc_device_t base;
@@ -439,7 +448,11 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		return DC_STATUS_NOMEMORY;
 	}
 
-	device->sequence = 1;
+	if (g_suunto_nautic_next_msgid == 0)
+		g_suunto_nautic_next_msgid = (unsigned int) time (NULL) * 2654435761u;
+	device->sequence = g_suunto_nautic_next_msgid & 0xFFFF;
+	if (device->sequence == 0)
+		device->sequence = 1;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
@@ -493,6 +506,8 @@ static dc_status_t
 suunto_nautic_device_close (dc_device_t *abstract)
 {
 	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+
+	g_suunto_nautic_next_msgid = device->sequence | 0x10000;
 
 	return dc_iostream_close (device->iostream);
 }
@@ -786,6 +801,14 @@ suunto_nautic_get_handle (dc_device_t *abstract, const char *path, unsigned char
 	}
 	memcpy (handle, ack_data + RPC_HANDLE_OFFSET, 3);
 	dc_buffer_free (ack);
+
+	// Every handle is released before the next GET, so a still-bound 00 slot
+	// was left by a link that dropped mid-transfer; free it.
+	if (handle[0] == RPC_HANDLE_SLOT_ALT) {
+		const unsigned char stale[3] = {RPC_HANDLE_SLOT, handle[1], handle[2]};
+		WARNING (abstract->context, "%s resolved to the 10 slot; releasing the stale 00 slot.", path);
+		suunto_nautic_release_handle (abstract, stale);
+	}
 
 	return DC_STATUS_SUCCESS;
 }
@@ -1492,6 +1515,8 @@ suunto_nautic_device_unsubscribe (dc_device_t *abstract, const unsigned char han
 
 	dc_status_t status = suunto_nautic_handle_request (abstract, RPC_OP_UNSUBSCRIBE, RPC_OP_UNSUBSCRIBE_REPLY, handle, reply);
 	dc_buffer_free (reply);
+	if (status == DC_STATUS_SUCCESS)
+		suunto_nautic_release_handle (abstract, handle);
 	return status;
 }
 
