@@ -109,6 +109,22 @@ suunto_nautic_device_download_summary (dc_device_t *device, const char *logbook_
 dc_status_t
 suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_buffer_t *raw);
 
+/*
+ * Value subscriptions (e.g. "/Logbook/UnsynchronisedLogs", "/Sync/BusyState").
+ * subscribe writes the resource handle and the current value; the value is
+ * Whiteboard-encoded as [type:u16 LE][value...]. wait_notification returns the
+ * next pushed value on any subscribed handle, or DC_STATUS_TIMEOUT after
+ * `timeout` milliseconds. Not valid while a dive download is in progress.
+ */
+dc_status_t
+suunto_nautic_device_subscribe (dc_device_t *device, const char *path, unsigned char handle[3], dc_buffer_t *value);
+
+dc_status_t
+suunto_nautic_device_unsubscribe (dc_device_t *device, const unsigned char handle[3]);
+
+dc_status_t
+suunto_nautic_device_wait_notification (dc_device_t *device, unsigned int timeout, unsigned char handle[3], dc_buffer_t *value);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
