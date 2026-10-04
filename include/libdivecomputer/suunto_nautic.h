@@ -68,7 +68,7 @@ suunto_nautic_device_fetch_raw (dc_device_t *device, const char *path, dc_buffer
 
 /*
  * List dive ids (each is a UNIX-timestamp LogId), newest-first, without
- * downloading the dives. `ids` receives the ids packed as little-endian
+ * downloading the dives. Follows every /Logbook/Entries page. `ids` receives the ids packed as little-endian
  * uint32 (4 bytes each); read them back as a plain array. This is the cheap
  * way to enumerate the logbook; the entry-parsing lives here in the driver so
  * callers don't reimplement it.
@@ -88,7 +88,7 @@ suunto_nautic_extract_entry_ids (const unsigned char data[], size_t size, unsign
 /*
  * Download a dive's /Summary (metadata: gradient factors, gas mix, ...).
  * Uses the paginated 0x0D fetch; `summary` receives the raw, uncompressed
- * SBEM0103 payload. The caller locates the "SBEM0103" signature and reads
+ * SBEM0103 payload (page headers and CRCs stripped). The caller locates the "SBEM0103" signature and reads
  * fields at documented offsets from it (unlike the profile from
  * suunto_nautic_device_download(), this is not Heatshrink-compressed).
  */
@@ -99,7 +99,12 @@ suunto_nautic_device_download_summary (dc_device_t *device, const char *logbook_
  * Download and decompress a specific logbook entry, given its numeric
  * id as it appears in a "/Logbook/byId/<id>/..." path (e.g.
  * "1787752091"). On success, `raw` holds the decoded SBEM0103 TLV
- * stream (magic-verified), suitable for suunto_nautic_parser_create().
+ * stream (magic-verified), suitable for suunto_nautic_parser_create(),
+ * with the /Summary SBEM appended when it could be fetched.
+ *
+ * The download is checked against the size /Logbook/Entries lists for the
+ * id. On a mismatch it returns DC_STATUS_DATAFORMAT with the (likely
+ * truncated) dive still in `raw`; on any other failure `raw` is empty.
  */
 dc_status_t
 suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_buffer_t *raw);

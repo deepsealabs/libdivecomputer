@@ -36,7 +36,7 @@
  *   - GET <entry>/Data (opcode 0x0A) -> ack -> two stream-fetch triggers
  *     -> chunk stream (opcode 0x01, repeated). The chunk stream is
  *     unacknowledged and continuous; the host buffers until a 2.0s
- *     silence timeout.
+ *     silence timeout, then closes it with STREAM_STOP (opcode 0x11).
  *   - Each 0x01 frame carries a 28-byte MDS header: payload size is a
  *     u16 LE at offset 20, payload starts at offset 28.
  *   - Payloads are Heatshrink-compressed (LZSS variant, see
@@ -60,8 +60,12 @@
  *   - suunto_nautic_device_foreach() fetches /Logbook/Entries (via the
  *     short 0x0D fetch; the listing endpoint rejects the stream fetch
  *     used for dive data) and extracts each dive's LogId, which is a
- *     UNIX timestamp, from the SBEM payload. Dives are downloaded
+ *     UNIX timestamp, from the SBEM payload. The list is served
+ *     oldest-first in pages (status 100 = more); later pages are fetched
+ *     with a uint32 StartAfterId parameter. Dives are downloaded
  *     newest-first, stopping at the first id matching the fingerprint.
+ *   - Each entry's listed size equals the compressed /Data plus the
+ *     /Summary data bytes, which verifies a download is complete.
  *
  * Datetime:
  *   - The stream carries no wall-clock timestamp except in GPS fixes
