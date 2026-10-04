@@ -46,6 +46,16 @@
 #define RPC_OP_STREAM_START  0x08 // watch -> host: stream accepted (200) or refused (e.g. 423 Locked)
 #define RPC_OP_STREAM_END    0x09 // watch -> host: the stream is closed (answers STREAM_STOP)
 
+// The /Data "stream" is a Whiteboard subscription: 0x10 subscribes to a
+// resource handle (answered by 0x08 with the current value), the watch then
+// pushes 0x01 notifications on that handle, and 0x11 unsubscribes (answered by
+// 0x09). Value resources such as /Logbook/UnsynchronisedLogs work the same way.
+#define RPC_OP_SUBSCRIBE         RPC_OP_STREAM_FETCH2
+#define RPC_OP_UNSUBSCRIBE       RPC_OP_STREAM_STOP
+#define RPC_OP_SUBSCRIBE_REPLY   RPC_OP_STREAM_START
+#define RPC_OP_UNSUBSCRIBE_REPLY RPC_OP_STREAM_END
+#define RPC_OP_NOTIFICATION      RPC_OP_STREAM_CHUNK
+
 // Fetch parameter types (Whiteboard type ids): the paged /Summary offset is an
 // int32, /Logbook/Entries' StartAfterId a uint32.
 #define RPC_PARAM_INT32  0x06
@@ -259,8 +269,8 @@ suunto_nautic_build_stream_fetch (unsigned char packet[], unsigned int size, uns
 // that ranged form to /Logbook/Entries makes the watch reject it with a
 // 400 Bad Request.
 static dc_status_t
-suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
-	unsigned int seq, const unsigned char handle[3])
+suunto_nautic_build_handle_op (unsigned char packet[], unsigned int size, unsigned int *out_len,
+	unsigned int seq, unsigned char opcode, const unsigned char handle[3])
 {
 	static const unsigned char tail[] = { 0x01, 0x80, 0x00, 0x00 };
 	unsigned int payload = 3 + (unsigned int) sizeof (tail); // handle(3) + tail
@@ -269,7 +279,7 @@ suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsi
 		return DC_STATUS_INVALIDARGS;
 
 	packet[0] = 0xA5;
-	packet[1] = RPC_OP_FETCH;
+	packet[1] = opcode;
 	// sublen counts seq(2)+payload minus 2, i.e. payload itself.
 	array_uint16_le_set (packet + 2, (unsigned short) payload);
 	array_uint16_le_set (packet + 4, (unsigned short) seq);
@@ -281,6 +291,13 @@ suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsi
 
 	*out_len = len;
 	return DC_STATUS_SUCCESS;
+}
+
+static dc_status_t
+suunto_nautic_build_short_fetch (unsigned char packet[], unsigned int size, unsigned int *out_len,
+	unsigned int seq, const unsigned char handle[3])
+{
+	return suunto_nautic_build_handle_op (packet, size, out_len, seq, RPC_OP_FETCH, handle);
 }
 
 // Build a 0x0D fetch carrying one 4-byte parameter. Payload is
@@ -1360,6 +1377,148 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 
 // True for a token that is exactly "<digits>.<digits>.<digits>", each part
 // < 256; on success fills a/b/c.
+// Send a handle-addressed request (subscribe/unsubscribe) and read until the
+// reply with `reply_op` echoing its message id; other frames on the link are
+// skipped. On success `reply` holds the whole reply frame.
+static dc_status_t
+suunto_nautic_handle_request (dc_device_t *abstract, unsigned char opcode, unsigned char reply_op,
+	const unsigned char handle[3], dc_buffer_t *reply)
+{
+	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+
+	if (device_is_cancelled (abstract))
+		return DC_STATUS_CANCELLED;
+
+	unsigned char req[32];
+	unsigned int req_len = 0;
+	unsigned int msgid = device->sequence & 0xFFFF;
+	dc_status_t status = suunto_nautic_build_handle_op (req, sizeof (req), &req_len, msgid, opcode, handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+	device->sequence++;
+
+	status = dc_iostream_write (device->iostream, req, req_len, NULL);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to send the 0x%02x request.", opcode);
+		return status;
+	}
+
+	unsigned int skips = 0;
+	for (;;) {
+		unsigned char packet[MAX_PACKET] = {0};
+		size_t len = 0;
+		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to receive the reply to the 0x%02x request.", opcode);
+			return status;
+		}
+		if (len >= RPC_STATUS_OFFSET + 2 && packet[0] == 0xA5 && packet[1] == reply_op &&
+			array_uint16_le (packet + RPC_MSGID_OFFSET) == msgid) {
+			dc_buffer_clear (reply);
+			if (!dc_buffer_append (reply, packet, len))
+				return DC_STATUS_NOMEMORY;
+			return DC_STATUS_SUCCESS;
+		}
+		if (++skips >= MAX_FOREIGN_SKIPS) {
+			ERROR (abstract->context, "No reply to the 0x%02x request among the frames on the link.", opcode);
+			return DC_STATUS_TIMEOUT;
+		}
+	}
+}
+
+dc_status_t
+suunto_nautic_device_subscribe (dc_device_t *abstract, const char *path, unsigned char handle[3], dc_buffer_t *value)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || handle == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_status_t status = suunto_nautic_get_handle (abstract, path, handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	// An unknown path is acknowledged with the FF FF FF handle (and a 404).
+	if (handle[0] == 0xFF && handle[1] == 0xFF && handle[2] == 0xFF) {
+		WARNING (abstract->context, "The watch has no %s resource.", path);
+		return DC_STATUS_UNSUPPORTED;
+	}
+
+	dc_buffer_t *reply = dc_buffer_new (0);
+	if (reply == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	status = suunto_nautic_handle_request (abstract, RPC_OP_SUBSCRIBE, RPC_OP_SUBSCRIBE_REPLY, handle, reply);
+	if (status == DC_STATUS_SUCCESS) {
+		const unsigned char *packet = dc_buffer_get_data (reply);
+		size_t len = dc_buffer_get_size (reply);
+		unsigned int frame_status = array_uint16_le (packet + RPC_STATUS_OFFSET);
+		if (frame_status != RPC_STATUS_OK) {
+			ERROR (abstract->context, "Watch refused the subscription to %s (status %u).", path, frame_status);
+			status = DC_STATUS_PROTOCOL;
+		} else if (value) {
+			// The reply carries the current value: [type:u16][value], then the CRC.
+			size_t start = RPC_STATUS_OFFSET + 2;
+			dc_buffer_clear (value);
+			if (len > start + RPC_CRC_SIZE && !dc_buffer_append (value, packet + start, len - start - RPC_CRC_SIZE))
+				status = DC_STATUS_NOMEMORY;
+		}
+	}
+
+	dc_buffer_free (reply);
+	return status;
+}
+
+dc_status_t
+suunto_nautic_device_unsubscribe (dc_device_t *abstract, const unsigned char handle[3])
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || handle == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_buffer_t *reply = dc_buffer_new (0);
+	if (reply == NULL)
+		return DC_STATUS_NOMEMORY;
+
+	dc_status_t status = suunto_nautic_handle_request (abstract, RPC_OP_UNSUBSCRIBE, RPC_OP_UNSUBSCRIBE_REPLY, handle, reply);
+	dc_buffer_free (reply);
+	return status;
+}
+
+dc_status_t
+suunto_nautic_device_wait_notification (dc_device_t *abstract, unsigned int timeout, unsigned char handle[3], dc_buffer_t *value)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || handle == NULL || value == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	suunto_nautic_device_t *device = (suunto_nautic_device_t *) abstract;
+
+	if (device_is_cancelled (abstract))
+		return DC_STATUS_CANCELLED;
+
+	dc_status_t status = dc_iostream_set_timeout (device->iostream, (int) timeout);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	// A value notification is [A5 01 sublen:2][msgid:2][handle:3][01 80 00][type:u16][value...][crc:4].
+	const size_t header = RPC_HANDLE_OFFSET + 3 + 3;
+	for (unsigned int skips = 0; skips < MAX_FOREIGN_SKIPS; skips++) {
+		unsigned char packet[MAX_PACKET] = {0};
+		size_t len = 0;
+		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
+		if (status != DC_STATUS_SUCCESS)
+			break;
+		HEXDUMP (abstract->context, DC_LOGLEVEL_DEBUG, "NOTIFY", packet, len);
+		if (len < header + RPC_CRC_SIZE || packet[0] != 0xA5 || packet[1] != RPC_OP_NOTIFICATION)
+			continue;
+		memcpy (handle, packet + RPC_HANDLE_OFFSET, 3);
+		dc_buffer_clear (value);
+		if (!dc_buffer_append (value, packet + header, len - header - RPC_CRC_SIZE))
+			status = DC_STATUS_NOMEMORY;
+		break;
+	}
+
+	dc_status_t restore = dc_iostream_set_timeout (device->iostream, 5000);
+	return status != DC_STATUS_SUCCESS ? status : restore;
+}
+
 static int
 suunto_nautic_parse_version (const char *tok, size_t len, unsigned int *a, unsigned int *b, unsigned int *c)
 {
