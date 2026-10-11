@@ -128,29 +128,45 @@
 // gives low > high.
 #define SUMMARY_GF_LOW   0x35 // uint16 LE, %
 #define SUMMARY_GF_HIGH  0x33 // uint16 LE, %
+// Water type (uint8): 0 fresh, 1 EN13319, 2 salt.
+#define SUMMARY_WATER_TYPE 0x3E
 // Gas/cylinder records: an array starting at SUMMARY_GAS_BASE, one 45-byte
 // record per configured gas. The record index equals the cylinder slot /
-// GasNumber, so tank i uses gas i. Within a record: O2% at +1, He% at +2,
-// PO2-max (float32 LE, bar) at +5, cylinder water capacity (float32 LE, m^3)
-// at +9. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
+// GasNumber, so tank i uses gas i. Within a record: O2% (int16 LE) at +1,
+// He% (int16 LE) at +3, PO2-max (float32 LE, bar) at +5, cylinder water
+// capacity (float32 LE, m^3) at +9, as the watch's own /Summary schema lays
+// them out. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
 // transmitters -- issue #29/#33/#34); a lone gas dive stops at the first
 // implausible slot, as before.
 #define SUMMARY_GAS_BASE   0xC7
 #define SUMMARY_GAS_STRIDE 45
-#define SUMMARY_GAS_O2     1  // uint8, %
-#define SUMMARY_GAS_HE     2  // uint8, %
+#define SUMMARY_GAS_O2     1  // int16 LE, %
+#define SUMMARY_GAS_HE     3  // int16 LE, %
 #define SUMMARY_GAS_VOLUME 9  // float32 LE, m^3
 // The dive record, the last /Summary record long enough to hold these, carries
 // the watch's own dive time and maximum depth (the app's DiveTime and
-// Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries.
+// Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries,
+// along with the app's DepthAverage (diving only) and Temperature.Min/Max.
+#define SUMMARY_DIVE_TEMP_MIN 313 // float32 LE, K
+#define SUMMARY_DIVE_TEMP_MAX 317 // float32 LE, K
 #define SUMMARY_DIVE_DIVETIME 321 // float32 LE, s, fractional
 #define SUMMARY_DIVE_MAXDEPTH 330 // float32 LE, m
+#define SUMMARY_DIVE_AVGDEPTH 338 // float32 LE, m
+// The DiveFooter (the second record) repeats the gas records from +282, with
+// each transmitter's start/end pressure: tank 1 at +25/+29, tank 2 at +33/+37
+// (int32 LE, Pa). The end pressures are the app's; the start pressures keep a
+// transmitter's pre-pairing dropout value (9 bar on 1788683271), so they aren't used.
+#define SUMMARY_FOOTER_RECORD   1
+#define SUMMARY_FOOTER_GAS_BASE 282
+#define SUMMARY_FOOTER_GAS_END1 29
+#define SUMMARY_FOOTER_GAS_END2 37
 
 typedef struct suunto_nautic_tank_t {
 	unsigned int used;
 	double beginpressure; // bar
 	double endpressure;   // bar
 	unsigned int gasmix;  // gas index (== cylinder slot / GasNumber)
+	unsigned int field;   // 0 = Pressure (first transmitter), 1 = Pressure2
 } suunto_nautic_tank_t;
 
 typedef struct suunto_nautic_parser_t {
@@ -178,6 +194,8 @@ typedef struct suunto_nautic_parser_t {
 	double gasvolume[MAX_GASMIXES]; // cylinder water capacity, litres (0 = unknown)
 	unsigned int have_decomodel;
 	dc_decomodel_t decomodel;
+	unsigned int have_salinity;
+	dc_salinity_t salinity;
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -306,9 +324,34 @@ suunto_nautic_find_summary (const unsigned char *data, size_t size)
 	return size;
 }
 
-// The /Summary's dive record: its records are plain [id][len] TLVs (the
-// profile's fixed-length table doesn't apply), ending in trailing bytes that
-// don't form a whole record.
+// The /Summary's records are plain [id][len] TLVs (the profile's fixed-length
+// table doesn't apply), ending in trailing bytes that don't form a whole
+// record. Record ids differ between models, so records are found by position.
+static const unsigned char *
+suunto_nautic_summary_record (const unsigned char *sbem, size_t size, unsigned int index, size_t *out_length)
+{
+	size_t pos = SBEM_MAGIC_SIZE;
+	for (unsigned int i = 0; pos + 2 <= size; i++) {
+		size_t length = sbem[pos + 1];
+		size_t header = 2;
+		if (length == 255) {
+			if (pos + 6 > size)
+				break;
+			length = array_uint32_le (sbem + pos + 2);
+			header = 6;
+		}
+		if (length > size - pos - header)
+			break;
+		if (i == index) {
+			*out_length = length;
+			return sbem + pos + header;
+		}
+		pos += header + length;
+	}
+	return NULL;
+}
+
+// The /Summary's dive record: the last record long enough to hold its fields.
 static const unsigned char *
 suunto_nautic_summary_dive_record (const unsigned char *sbem, size_t size)
 {
@@ -325,7 +368,7 @@ suunto_nautic_summary_dive_record (const unsigned char *sbem, size_t size)
 		}
 		if (length > size - pos - header)
 			break;
-		if (length >= SUMMARY_DIVE_MAXDEPTH + 4)
+		if (length >= SUMMARY_DIVE_AVGDEPTH + 4)
 			record = sbem + pos + header;
 		pos += header + length;
 	}
@@ -350,13 +393,23 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 		parser->have_decomodel = 1;
 	}
 
+	if (size > SUMMARY_WATER_TYPE) {
+		unsigned int type = sbem[SUMMARY_WATER_TYPE];
+		if (type <= 2) {
+			static const double density[] = {1000.0, 1020.0, 1030.0};
+			parser->salinity.type = type ? DC_WATER_SALT : DC_WATER_FRESH;
+			parser->salinity.density = density[type];
+			parser->have_salinity = 1;
+		}
+	}
+
 	for (unsigned int i = 0; i < MAX_GASMIXES; i++) {
 		size_t base = SUMMARY_GAS_BASE + (size_t) i * SUMMARY_GAS_STRIDE;
-		if (base + SUMMARY_GAS_O2 >= size)
+		if (base + SUMMARY_GAS_HE + 2 > size)
 			break;
-		unsigned int o2 = sbem[base + SUMMARY_GAS_O2];
-		unsigned int he = sbem[base + SUMMARY_GAS_HE];
-		if (o2 < 1 || o2 > 100 || he > 100 || o2 + he > 100)
+		int o2 = (int16_t) array_uint16_le (sbem + base + SUMMARY_GAS_O2);
+		int he = (int16_t) array_uint16_le (sbem + base + SUMMARY_GAS_HE);
+		if (o2 < 1 || o2 > 100 || he < 0 || he > 100 || o2 + he > 100)
 			break; // unused/implausible slot -- stop
 		unsigned int g = parser->ngasmixes;
 		parser->gasmix[g].oxygen = o2 / 100.0;
@@ -486,10 +539,15 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	// it has read non-zero at least twice (p2_first holds the first value).
 	int tankmap[MAX_TANKS * 2];
 	int p2_first[MAX_TANKS];
+	// The last reading of each tank while Diving: readings taken on the surface
+	// after the dive can be of a closed, purged regulator (~1 bar).
+	double diving_end[MAX_TANKS];
 	for (unsigned int ti = 0; ti < MAX_TANKS * 2; ti++)
 		tankmap[ti] = -1;
-	for (unsigned int ti = 0; ti < MAX_TANKS; ti++)
+	for (unsigned int ti = 0; ti < MAX_TANKS; ti++) {
 		p2_first[ti] = -1;
+		diving_end[ti] = -1.0;
+	}
 
 	unsigned int have_location = 0;
 	dc_location_t location = {0};
@@ -621,6 +679,7 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 							// Cylinder slot index == GasNumber, so this tank
 							// breathes gas i (linked to gasmix[i] below).
 							tank[ntanks].gasmix = i;
+							tank[ntanks].field = field;
 							// Seed begin from the first observed reading (the deferred
 							// one for Pressure2); refined to the max below.
 							tank[ntanks].beginpressure = (field == 1 && p2_first[i] >= 0)
@@ -629,6 +688,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 						}
 						unsigned int t = (unsigned int) tankmap[key];
 						tank[t].endpressure = bar;
+						if (dive_state == DIVE_STATE_DIVING)
+							diving_end[t] = bar;
 						// Begin pressure = the highest reading seen: a cylinder only
 						// loses pressure during a dive, so the max is the true start.
 						// This ignores an initial dropout where a transmitter that
@@ -888,6 +949,10 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->temperature_surface = temperature_surface;
 	parser->temperature_minimum = temperature_minimum;
 	parser->temperature_maximum = temperature_maximum;
+	for (unsigned int t = 0; t < ntanks; t++) {
+		if (diving_end[t] >= 0.0)
+			tank[t].endpressure = diving_end[t];
+	}
 	parser->ntanks = ntanks;
 	memcpy (parser->tank, tank, sizeof (tank));
 	parser->have_location = have_location;
@@ -900,6 +965,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	// Gradient factors and gas mixes from the appended /Summary section.
 	parser->ngasmixes = 0;
 	parser->have_decomodel = 0;
+	parser->have_salinity = 0;
+	memset (&parser->salinity, 0, sizeof (parser->salinity));
 	memset (parser->gasmix, 0, sizeof (parser->gasmix));
 	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
 	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
@@ -910,7 +977,10 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 		// The watch's maximum is deeper than any logged sample (the app shows
 		// it). Trusted only on a record whose dive time agrees with the
-		// profile's, and when it is close to the sampled maximum.
+		// profile's, and when it is close to the sampled maximum. The same
+		// record's average depth and water temperature range are the app's
+		// figures too; the temperatures are taken only as a sane pair, since
+		// one Ocean dive records its minimum above its maximum.
 		const unsigned char *record = suunto_nautic_summary_dive_record (sbem, sbem_size);
 		if (record && parser->divetime > 0) {
 			double divetime = array_float_le (record + SUMMARY_DIVE_DIVETIME);
@@ -921,6 +991,28 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				parser->divetime = (unsigned int) divetime;
 				if (maxdepth > 0.0 && depth >= maxdepth - 0.5 && depth <= maxdepth + 3.0)
 					parser->maxdepth = depth;
+				double avgdepth = array_float_le (record + SUMMARY_DIVE_AVGDEPTH);
+				if (avgdepth > 0.0 && avgdepth <= parser->maxdepth)
+					parser->avgdepth = avgdepth;
+				double tmin = array_float_le (record + SUMMARY_DIVE_TEMP_MIN);
+				double tmax = array_float_le (record + SUMMARY_DIVE_TEMP_MAX);
+				if (have_temperature && tmin > 250.0 && tmax < 330.0 && tmin <= tmax) {
+					parser->temperature_minimum = tmin - 273.15;
+					parser->temperature_maximum = tmax - 273.15;
+				}
+
+				size_t footer_size = 0;
+				const unsigned char *footer = suunto_nautic_summary_record (sbem, sbem_size, SUMMARY_FOOTER_RECORD, &footer_size);
+				for (unsigned int t = 0; footer && t < parser->ntanks; t++) {
+					suunto_nautic_tank_t *tk = &parser->tank[t];
+					size_t base = SUMMARY_FOOTER_GAS_BASE + (size_t) tk->gasmix * SUMMARY_GAS_STRIDE;
+					if (base + SUMMARY_GAS_STRIDE > footer_size)
+						continue;
+					int pa = (int) array_uint32_le (footer + base + (tk->field ? SUMMARY_FOOTER_GAS_END2 : SUMMARY_FOOTER_GAS_END1));
+					double bar = pa / 100000.0;
+					if (bar > 0.0 && bar <= tk->beginpressure + 1.0)
+						tk->endpressure = bar;
+				}
 			}
 		}
 	}
@@ -1046,6 +1138,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		break;
 	case DC_FIELD_DIVEMODE:
 		*((dc_divemode_t *) value) = parser->divemode;
+		break;
+	case DC_FIELD_SALINITY:
+		if (!parser->have_salinity)
+			return DC_STATUS_UNSUPPORTED;
+		*((dc_salinity_t *) value) = parser->salinity;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
