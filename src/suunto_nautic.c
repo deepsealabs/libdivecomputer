@@ -46,6 +46,7 @@
 #define RPC_OP_DATA          0x05
 #define RPC_OP_STREAM_START  0x08 // watch -> host: stream accepted (200) or refused (e.g. 423 Locked)
 #define RPC_OP_STREAM_END    0x09 // watch -> host: the stream is closed (answers STREAM_STOP)
+#define RPC_OP_HELLO_ACK     0x13 // watch -> host: answers the EVA (Hello, 0x12) handshake
 
 // The /Data "stream" is a Whiteboard subscription: 0x10 subscribes to a
 // resource handle (answered by 0x08 with the current value), the watch then
@@ -469,8 +470,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 
 	dc_iostream_purge (device->iostream, DC_DIRECTION_ALL);
 
-	// Best-effort EVA handshake. The response content can't be validated
-	// (its format isn't understood), so only the I/O round-trip is required.
+	// EVA handshake. The response content can't be validated (its format isn't
+	// understood), but its arrival can: the watch answers with a Hello-Ack.
 	HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA REQ", suunto_nautic_eva_handshake, EVA_HANDSHAKE_SIZE);
 
 	status = dc_iostream_write (device->iostream, suunto_nautic_eva_handshake, EVA_HANDSHAKE_SIZE, NULL);
@@ -479,17 +480,38 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		goto error_close;
 	}
 
+	// On a quick reconnect the watch is still sending the tail of the stream the
+	// dropped link was reading, ahead of the Hello-Ack, and a request sent before
+	// the Ack has arrived can go unanswered. The purge above runs too early to
+	// catch those frames, so skip them here until the Ack turns up. If the link
+	// goes quiet without one, carry on as before: the stale frames are drained.
 	unsigned char handshake_rsp[MAX_PACKET] = {0};
 	size_t handshake_len = 0;
-	status = dc_iostream_read (device->iostream, handshake_rsp, sizeof (handshake_rsp), &handshake_len);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (context, "Failed to receive the EVA handshake response. The device may not "
-			"support this protocol, or the handshake payload may need updating "
-			"(see suunto_nautic.h).");
-		goto error_close;
-	}
+	unsigned int handshake_skips = 0;
+	for (;;) {
+		status = dc_iostream_read (device->iostream, handshake_rsp, sizeof (handshake_rsp), &handshake_len);
+		if (status == DC_STATUS_TIMEOUT && handshake_skips > 0) {
+			WARNING (context, "No EVA handshake response after %u other frames; continuing.", handshake_skips);
+			break;
+		}
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (context, "Failed to receive the EVA handshake response. The device may not "
+				"support this protocol, or the handshake payload may need updating "
+				"(see suunto_nautic.h).");
+			goto error_close;
+		}
 
-	HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA RSP", handshake_rsp, handshake_len);
+		HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA RSP", handshake_rsp, handshake_len);
+
+		if (handshake_len >= 2 && handshake_rsp[0] == 0xA5 && handshake_rsp[1] == RPC_OP_HELLO_ACK)
+			break;
+		if (++handshake_skips >= MAX_FOREIGN_SKIPS) {
+			ERROR (context, "No EVA handshake response among the frames on the link.");
+			status = DC_STATUS_TIMEOUT;
+			goto error_close;
+		}
+		WARNING (context, "Skipping a frame ahead of the EVA handshake response (" DC_PRINTF_SIZE " bytes).", handshake_len);
+	}
 
 	*out = (dc_device_t *) device;
 
