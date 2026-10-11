@@ -128,23 +128,30 @@
 // gives low > high.
 #define SUMMARY_GF_LOW   0x35 // uint16 LE, %
 #define SUMMARY_GF_HIGH  0x33 // uint16 LE, %
+// Water type (uint8): 0 fresh, 1 EN13319, 2 salt.
+#define SUMMARY_WATER_TYPE 0x3E
 // Gas/cylinder records: an array starting at SUMMARY_GAS_BASE, one 45-byte
 // record per configured gas. The record index equals the cylinder slot /
-// GasNumber, so tank i uses gas i. Within a record: O2% at +1, He% at +2,
-// PO2-max (float32 LE, bar) at +5, cylinder water capacity (float32 LE, m^3)
-// at +9. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
+// GasNumber, so tank i uses gas i. Within a record: O2% (int16 LE) at +1,
+// He% (int16 LE) at +3, PO2-max (float32 LE, bar) at +5, cylinder water
+// capacity (float32 LE, m^3) at +9, as the watch's own /Summary schema lays
+// them out. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
 // transmitters -- issue #29/#33/#34); a lone gas dive stops at the first
 // implausible slot, as before.
 #define SUMMARY_GAS_BASE   0xC7
 #define SUMMARY_GAS_STRIDE 45
-#define SUMMARY_GAS_O2     1  // uint8, %
-#define SUMMARY_GAS_HE     2  // uint8, %
+#define SUMMARY_GAS_O2     1  // int16 LE, %
+#define SUMMARY_GAS_HE     3  // int16 LE, %
 #define SUMMARY_GAS_VOLUME 9  // float32 LE, m^3
 // The dive record, the last /Summary record long enough to hold these, carries
 // the watch's own dive time and maximum depth (the app's DiveTime and
-// Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries.
+// Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries,
+// along with the app's DepthAverage (diving only) and Temperature.Min/Max.
+#define SUMMARY_DIVE_TEMP_MIN 313 // float32 LE, K
+#define SUMMARY_DIVE_TEMP_MAX 317 // float32 LE, K
 #define SUMMARY_DIVE_DIVETIME 321 // float32 LE, s, fractional
 #define SUMMARY_DIVE_MAXDEPTH 330 // float32 LE, m
+#define SUMMARY_DIVE_AVGDEPTH 338 // float32 LE, m
 
 typedef struct suunto_nautic_tank_t {
 	unsigned int used;
@@ -178,6 +185,8 @@ typedef struct suunto_nautic_parser_t {
 	double gasvolume[MAX_GASMIXES]; // cylinder water capacity, litres (0 = unknown)
 	unsigned int have_decomodel;
 	dc_decomodel_t decomodel;
+	unsigned int have_salinity;
+	dc_salinity_t salinity;
 } suunto_nautic_parser_t;
 
 typedef struct sbem_chunk_t {
@@ -325,7 +334,7 @@ suunto_nautic_summary_dive_record (const unsigned char *sbem, size_t size)
 		}
 		if (length > size - pos - header)
 			break;
-		if (length >= SUMMARY_DIVE_MAXDEPTH + 4)
+		if (length >= SUMMARY_DIVE_AVGDEPTH + 4)
 			record = sbem + pos + header;
 		pos += header + length;
 	}
@@ -350,13 +359,23 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 		parser->have_decomodel = 1;
 	}
 
+	if (size > SUMMARY_WATER_TYPE) {
+		unsigned int type = sbem[SUMMARY_WATER_TYPE];
+		if (type <= 2) {
+			static const double density[] = {1000.0, 1020.0, 1030.0};
+			parser->salinity.type = type ? DC_WATER_SALT : DC_WATER_FRESH;
+			parser->salinity.density = density[type];
+			parser->have_salinity = 1;
+		}
+	}
+
 	for (unsigned int i = 0; i < MAX_GASMIXES; i++) {
 		size_t base = SUMMARY_GAS_BASE + (size_t) i * SUMMARY_GAS_STRIDE;
-		if (base + SUMMARY_GAS_O2 >= size)
+		if (base + SUMMARY_GAS_HE + 2 > size)
 			break;
-		unsigned int o2 = sbem[base + SUMMARY_GAS_O2];
-		unsigned int he = sbem[base + SUMMARY_GAS_HE];
-		if (o2 < 1 || o2 > 100 || he > 100 || o2 + he > 100)
+		int o2 = (int16_t) array_uint16_le (sbem + base + SUMMARY_GAS_O2);
+		int he = (int16_t) array_uint16_le (sbem + base + SUMMARY_GAS_HE);
+		if (o2 < 1 || o2 > 100 || he < 0 || he > 100 || o2 + he > 100)
 			break; // unused/implausible slot -- stop
 		unsigned int g = parser->ngasmixes;
 		parser->gasmix[g].oxygen = o2 / 100.0;
@@ -900,6 +919,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	// Gradient factors and gas mixes from the appended /Summary section.
 	parser->ngasmixes = 0;
 	parser->have_decomodel = 0;
+	parser->have_salinity = 0;
+	memset (&parser->salinity, 0, sizeof (parser->salinity));
 	memset (parser->gasmix, 0, sizeof (parser->gasmix));
 	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
 	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
@@ -910,7 +931,10 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 		// The watch's maximum is deeper than any logged sample (the app shows
 		// it). Trusted only on a record whose dive time agrees with the
-		// profile's, and when it is close to the sampled maximum.
+		// profile's, and when it is close to the sampled maximum. The same
+		// record's average depth and water temperature range are the app's
+		// figures too; the temperatures are taken only as a sane pair, since
+		// one Ocean dive records its minimum above its maximum.
 		const unsigned char *record = suunto_nautic_summary_dive_record (sbem, sbem_size);
 		if (record && parser->divetime > 0) {
 			double divetime = array_float_le (record + SUMMARY_DIVE_DIVETIME);
@@ -921,6 +945,15 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				parser->divetime = (unsigned int) divetime;
 				if (maxdepth > 0.0 && depth >= maxdepth - 0.5 && depth <= maxdepth + 3.0)
 					parser->maxdepth = depth;
+				double avgdepth = array_float_le (record + SUMMARY_DIVE_AVGDEPTH);
+				if (avgdepth > 0.0 && avgdepth <= parser->maxdepth)
+					parser->avgdepth = avgdepth;
+				double tmin = array_float_le (record + SUMMARY_DIVE_TEMP_MIN);
+				double tmax = array_float_le (record + SUMMARY_DIVE_TEMP_MAX);
+				if (have_temperature && tmin > 250.0 && tmax < 330.0 && tmin <= tmax) {
+					parser->temperature_minimum = tmin - 273.15;
+					parser->temperature_maximum = tmax - 273.15;
+				}
 			}
 		}
 	}
@@ -1046,6 +1079,11 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		break;
 	case DC_FIELD_DIVEMODE:
 		*((dc_divemode_t *) value) = parser->divemode;
+		break;
+	case DC_FIELD_SALINITY:
+		if (!parser->have_salinity)
+			return DC_STATUS_UNSUPPORTED;
+		*((dc_salinity_t *) value) = parser->salinity;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
