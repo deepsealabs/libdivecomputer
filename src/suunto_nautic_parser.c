@@ -979,8 +979,8 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 		// it). Trusted only on a record whose dive time agrees with the
 		// profile's, and when it is close to the sampled maximum. The same
 		// record's average depth and water temperature range are the app's
-		// figures too; the temperatures are taken only as a sane pair, since
-		// one Ocean dive records its minimum above its maximum.
+		// figures too. The Ocean can store the temperature pair reversed (the
+		// app then shows Min 29.35 and Max 18.85 C), so it is ordered here.
 		const unsigned char *record = suunto_nautic_summary_dive_record (sbem, sbem_size);
 		if (record && parser->divetime > 0) {
 			double divetime = array_float_le (record + SUMMARY_DIVE_DIVETIME);
@@ -996,7 +996,12 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 					parser->avgdepth = avgdepth;
 				double tmin = array_float_le (record + SUMMARY_DIVE_TEMP_MIN);
 				double tmax = array_float_le (record + SUMMARY_DIVE_TEMP_MAX);
-				if (have_temperature && tmin > 250.0 && tmax < 330.0 && tmin <= tmax) {
+				if (tmin > tmax) {
+					double t = tmin;
+					tmin = tmax;
+					tmax = t;
+				}
+				if (have_temperature && tmin > 250.0 && tmax < 330.0) {
 					parser->temperature_minimum = tmin - 273.15;
 					parser->temperature_maximum = tmax - 273.15;
 				}

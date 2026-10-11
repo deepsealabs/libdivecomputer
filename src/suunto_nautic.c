@@ -127,9 +127,10 @@
 // size = compressed /Data + /Summary data bytes, exactly.
 #define ENTRY_SIZE_OFFSET 16
 
-// Safety cap on paginated-fetch pages (a Summary is a handful of pages, and
-// /Logbook/Entries one page per ~18 dives).
-#define MAX_PAGES 64
+// Safety cap on paginated-fetch pages (a Summary is a handful of pages,
+// /Logbook/Entries one page per ~18 dives, and a dive's Descriptors schema
+// about 97).
+#define MAX_PAGES 512
 
 // The Suunto "MDS" chunk header wrapping each compressed block: 28 bytes,
 // with the true payload size as a u16 LE at offset 20 and the compressed
@@ -718,8 +719,16 @@ suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_b
 		goto release;
 	}
 
+	// A long dive streams for minutes, so a cancel is honoured between frames;
+	// the stream is still stopped below so the watch doesn't keep sending it.
+	unsigned int cancelled = 0;
 	unsigned int nframes = 0;
 	for (nframes = 0; nframes < MAX_CHUNKS; nframes++) {
+		if (device_is_cancelled (abstract)) {
+			cancelled = 1;
+			break;
+		}
+
 		unsigned char packet[MAX_PACKET] = {0};
 		size_t len = 0;
 		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &len);
@@ -753,7 +762,7 @@ suunto_nautic_device_stream_fetch (dc_device_t *abstract, const char *path, dc_b
 				return status;
 		}
 	}
-	status = DC_STATUS_SUCCESS;
+	status = cancelled ? DC_STATUS_CANCELLED : DC_STATUS_SUCCESS;
 
 	if (nframes >= MAX_CHUNKS)
 		WARNING (abstract->context, "Stream for %s hit the %u-frame guard; the dive may be truncated.", path, MAX_CHUNKS);
