@@ -86,6 +86,14 @@ unsigned int
 suunto_nautic_extract_entry_ids (const unsigned char data[], size_t size, unsigned int *ids, unsigned int max_ids);
 
 /*
+ * Paged 0x0D fetch of any resource (GET -> every page -> release), up to
+ * MAX_PAGES. For multi-page /Logbook/byId/<id>/... resources such as
+ * Descriptors; `response` receives the data bytes with page headers stripped.
+ */
+dc_status_t
+suunto_nautic_device_fetch_paged (dc_device_t *device, const char *path, dc_buffer_t *response);
+
+/*
  * Download a dive's /Summary (metadata: gradient factors, gas mix, ...).
  * Uses the paginated 0x0D fetch; `summary` receives the raw, uncompressed
  * SBEM0103 payload (page headers and CRCs stripped). The caller locates the "SBEM0103" signature and reads
