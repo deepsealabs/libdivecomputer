@@ -1097,6 +1097,15 @@ suunto_nautic_device_fetch_raw (dc_device_t *abstract, const char *path, dc_buff
 }
 
 dc_status_t
+suunto_nautic_device_fetch_paged (dc_device_t *abstract, const char *path, dc_buffer_t *response)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || path == NULL || response == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	return suunto_nautic_device_paginated_fetch (abstract, path, response);
+}
+
+dc_status_t
 suunto_nautic_device_download_summary (dc_device_t *abstract, const char *logbook_id, dc_buffer_t *summary)
 {
 	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC || logbook_id == NULL || summary == NULL)
