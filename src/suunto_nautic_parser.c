@@ -157,6 +157,13 @@
 // (int32 LE, Pa). The end pressures are the app's; the start pressures keep a
 // transmitter's pre-pairing dropout value (9 bar on 1788683271), so they aren't used.
 #define SUMMARY_FOOTER_RECORD   1
+// Records 2-4 are the Windows; each carries Temperature.Min/Max (float32 LE, K)
+// in the order its schema gives, on both watches. The dive record's pair above is
+// reversed by Ocean firmware, so the Windows are read first.
+#define SUMMARY_WINDOW_FIRST    2
+#define SUMMARY_WINDOW_COUNT    3
+#define SUMMARY_WINDOW_TEMP_MIN 101
+#define SUMMARY_WINDOW_TEMP_MAX 105
 #define SUMMARY_FOOTER_GAS_BASE 282
 #define SUMMARY_FOOTER_GAS_END1 29
 #define SUMMARY_FOOTER_GAS_END2 37
@@ -349,6 +356,29 @@ suunto_nautic_summary_record (const unsigned char *sbem, size_t size, unsigned i
 		pos += header + length;
 	}
 	return NULL;
+}
+
+// Lowest minimum and highest maximum water temperature across the Windows records (K).
+static int
+suunto_nautic_summary_window_temperatures (const unsigned char *sbem, size_t size, double *tmin, double *tmax)
+{
+	int found = 0;
+	for (unsigned int i = 0; i < SUMMARY_WINDOW_COUNT; i++) {
+		size_t length = 0;
+		const unsigned char *window = suunto_nautic_summary_record (sbem, size, SUMMARY_WINDOW_FIRST + i, &length);
+		if (window == NULL || length < SUMMARY_WINDOW_TEMP_MAX + 4)
+			continue;
+		double lo = array_float_le (window + SUMMARY_WINDOW_TEMP_MIN);
+		double hi = array_float_le (window + SUMMARY_WINDOW_TEMP_MAX);
+		if (!(lo > 250.0 && hi < 330.0 && lo <= hi))
+			continue;
+		if (!found || lo < *tmin)
+			*tmin = lo;
+		if (!found || hi > *tmax)
+			*tmax = hi;
+		found = 1;
+	}
+	return found;
 }
 
 // The /Summary's dive record: the last record long enough to hold its fields.
@@ -994,8 +1024,11 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				double avgdepth = array_float_le (record + SUMMARY_DIVE_AVGDEPTH);
 				if (avgdepth > 0.0 && avgdepth <= parser->maxdepth)
 					parser->avgdepth = avgdepth;
-				double tmin = array_float_le (record + SUMMARY_DIVE_TEMP_MIN);
-				double tmax = array_float_le (record + SUMMARY_DIVE_TEMP_MAX);
+				double tmin = 0.0, tmax = 0.0;
+				if (!suunto_nautic_summary_window_temperatures (sbem, sbem_size, &tmin, &tmax)) {
+					tmin = array_float_le (record + SUMMARY_DIVE_TEMP_MIN);
+					tmax = array_float_le (record + SUMMARY_DIVE_TEMP_MAX);
+				}
 				if (tmin > tmax) {
 					double t = tmin;
 					tmin = tmax;

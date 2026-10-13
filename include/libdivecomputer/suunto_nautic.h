@@ -44,6 +44,14 @@ extern "C" {
  * "/System/Mode", "/Logbook/Entries") and return the raw, undecoded
  * response payload (the ACK only).
  */
+/*
+ * 1 when the watch answered the EVA handshake on open. The open still succeeds
+ * when only other frames arrived before the link went quiet (a sleeping watch
+ * or the tail of an earlier stream), so 0 means the first request may time out.
+ */
+int
+suunto_nautic_device_handshake_acknowledged (dc_device_t *device);
+
 dc_status_t
 suunto_nautic_device_request (dc_device_t *device, const char *path, dc_buffer_t *response);
 
