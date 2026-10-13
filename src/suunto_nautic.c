@@ -160,6 +160,8 @@ typedef struct suunto_nautic_device_t {
 	// fingerprint set" (a real dive ID is never 0 -- that would be a
 	// 1970 timestamp), matching every other driver's convention.
 	unsigned char fingerprint[4];
+	// Whether the watch answered the EVA handshake; the open carries on without it.
+	int handshake_acknowledged;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -456,6 +458,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	if (device->sequence == 0)
 		device->sequence = 1;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
+	device->handshake_acknowledged = 0;
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -504,8 +507,10 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 
 		HEXDUMP (context, DC_LOGLEVEL_DEBUG, "EVA RSP", handshake_rsp, handshake_len);
 
-		if (handshake_len >= 2 && handshake_rsp[0] == 0xA5 && handshake_rsp[1] == RPC_OP_HELLO_ACK)
+		if (handshake_len >= 2 && handshake_rsp[0] == 0xA5 && handshake_rsp[1] == RPC_OP_HELLO_ACK) {
+			device->handshake_acknowledged = 1;
 			break;
+		}
 		if (++handshake_skips >= MAX_FOREIGN_SKIPS) {
 			ERROR (context, "No EVA handshake response among the frames on the link.");
 			status = DC_STATUS_TIMEOUT;
@@ -533,6 +538,15 @@ suunto_nautic_device_close (dc_device_t *abstract)
 	g_suunto_nautic_next_msgid = device->sequence | 0x10000;
 
 	return dc_iostream_close (device->iostream);
+}
+
+int
+suunto_nautic_device_handshake_acknowledged (dc_device_t *abstract)
+{
+	if (abstract == NULL || abstract->vtable->type != DC_FAMILY_SUUNTO_NAUTIC)
+		return 0;
+
+	return ((suunto_nautic_device_t *) abstract)->handshake_acknowledged;
 }
 
 dc_status_t
