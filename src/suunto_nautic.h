@@ -25,25 +25,27 @@
  * Transport and framing:
  *   - BLE, with HDLC framing (flag 0x7E, escape 0x7D / XOR 0x20; no
  *     separate checksum at this layer).
- *   - Path-addressed GET requests use the RPC frame envelope:
- *       0xA5, opcode, sublen(u16 LE), seq(u16 LE), 0x01, 0x80, 0x00,
- *       pathlen(u8), path bytes..., crc32(u32 LE)
- *     where crc32 is the reflected CRC-32 (checksum_crc32r) of every
- *     preceding byte. A single monotonic per-connection sequence counter
- *     is used for all requests.
+ *   - Every packet is 0xA5, opcode, length(u16 LE), seqnum(u16 LE),
+ *     payload(length), crc32(u32 LE), where crc32 is the reflected CRC-32
+ *     (checksum_crc32r) of every preceding byte. A reply echoes the
+ *     request's sequence number. The watch serves every app connected to
+ *     it over the same link, so replies to another app's requests are
+ *     recognized by their sequence number and skipped.
+ *   - A GET (0x0A) resolves a path to a handle; the other requests (FETCH
+ *     0x0D, SUBSCRIBE 0x10, UNSUBSCRIBE 0x11, RELEASE 0x0B) address that
+ *     handle. A per-dive handle stays bound until it is released.
  *
  * Dive download:
- *   - GET <entry>/Data (opcode 0x0A) -> ack carrying the handle bound to
- *     that dive -> subscribe on that handle (0x10) -> chunk stream (opcode
- *     0x01, repeated). The chunk stream is unacknowledged and continuous;
- *     the host buffers until a 2.0s silence timeout, then closes it with
- *     STREAM_STOP (opcode 0x11) and releases the handle (opcode 0x0B), as
- *     a still-bound handle makes the next GET of /Data bind another slot.
- *   - Each 0x01 frame carries a 28-byte MDS header: payload size is a
- *     u16 LE at offset 20, payload starts at offset 28.
- *   - Payloads are Heatshrink-compressed (LZSS variant, see
+ *   - GET /Logbook/byId/<id>/Data, SUBSCRIBE: the watch streams the
+ *     compressed dive in unacknowledged notifications (0x01), each with
+ *     its offset in the stream, and ends with a zero length chunk at the
+ *     total size. Then UNSUBSCRIBE and RELEASE.
+ *   - The stream is Heatshrink-compressed (LZSS variant, see
  *     src/heatshrink/; window_sz2 = 7, lookahead_sz2 = 5). The decoded
  *     stream is an SBEM0103 container.
+ *   - GET /Logbook/byId/<id>/Summary, FETCH page by page: an uncompressed
+ *     SBEM0103 container with the fields that are not in the profile
+ *     (gradient factors, gas mixes). It is appended to the profile.
  *
  * SBEM0103 container:
  *   - A numeric Type-Length-Value stream: [id: 1 byte][length: 1 byte]
@@ -59,15 +61,10 @@
  *     led by a VENDOR_KIND_* byte.
  *
  * Enumeration:
- *   - suunto_nautic_device_foreach() fetches /Logbook/Entries (via the
- *     short 0x0D fetch; the listing endpoint rejects the stream fetch
- *     used for dive data) and extracts each dive's LogId, which is a
- *     UNIX timestamp, from the SBEM payload. The list is served
- *     oldest-first in pages (status 100 = more); later pages are fetched
- *     with a uint32 StartAfterId parameter. Dives are downloaded
- *     newest-first, stopping at the first id matching the fingerprint.
- *   - Each entry's listed size equals the compressed /Data plus the
- *     /Summary data bytes, which verifies a download is complete.
+ *   - /Logbook/Entries lists the dives, oldest first and in pages. Each
+ *     record holds the dive id (its start time, a UNIX timestamp) and its
+ *     size, which is checked against the download. Dives are downloaded
+ *     newest first, stopping at the first id matching the fingerprint.
  *
  * Datetime:
  *   - The stream carries no wall-clock timestamp except in GPS fixes
