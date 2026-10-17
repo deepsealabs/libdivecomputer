@@ -160,6 +160,11 @@ typedef struct suunto_nautic_device_t {
 	// Set once a download has stepped aside for another app: a 423 (Locked)
 	// after that means the other app is still streaming, so pause again.
 	int yielded;
+	// The handle of the stream in progress (0 = none). The watch has one
+	// handle for streaming a dive's /Data, shared by every client: another
+	// app's GET of a dive's /Data re-points it, and our subscription then
+	// carries that app's dive.
+	unsigned int stream_handle;
 } suunto_nautic_device_t;
 
 // Dive ids and their listed sizes, newest first.
@@ -327,6 +332,15 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 				}
 				continue;
 			}
+			// Another app bound our stream's handle to its own dive: from now
+			// on our subscription carries its data.
+			if (streaming && device->stream_handle && rsp_length >= 3 &&
+				(rsp_opcode == RPC_OP_GET_REPLY || rsp_opcode == RPC_OP_SUBSCRIBE_REPLY) &&
+				(array_uint24_le (packet + 6) & ~0xFFu) == (device->stream_handle & ~0xFFu)) {
+				WARNING (device->base.context, "Another app took over the stream's handle (%06x).", array_uint24_le (packet + 6));
+				device->contended = 1;
+				return DC_STATUS_PROTOCOL;
+			}
 			// The watch ended our stream itself (status 404) for that session.
 			if (streaming && rsp_opcode == RPC_OP_UNSUBSCRIBE_REPLY && rsp_length >= REPLY_CONTENT &&
 				array_uint16_le (packet + 6 + REPLY_STATUS) != STATUS_OK) {
@@ -418,6 +432,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	device->contended = 0;
 	device->stale_handle = 0;
 	device->yielded = 0;
+	device->stream_handle = 0;
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -687,6 +702,7 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffe
 		goto error_release;
 	}
 
+	device->stream_handle = handle;
 	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_STREAM);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to set the timeout.");
@@ -778,6 +794,7 @@ error_unsubscribe:
 	}
 
 error_release:
+	device->stream_handle = 0;
 	if (!device->contended)
 		suunto_nautic_release (device, handle);
 	else
@@ -1197,6 +1214,17 @@ suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigne
 
 		WARNING (abstract->context, "Incomplete download of dive %u (" DC_PRINTF_SIZE " + " DC_PRINTF_SIZE " bytes, listed %u).",
 			id, data_size, summary_size, listed);
+
+		// After another app has had the watch, a wrong size most likely means
+		// its traffic got into our stream: step aside again and redo the dive
+		// rather than keep a truncated or mixed one.
+		if (device->yielded) {
+			status = suunto_nautic_yield (device, &yields);
+			if (status != DC_STATUS_SUCCESS)
+				goto error_free;
+			attempt = (unsigned int) -1; // the increment brings it back to 0
+			continue;
+		}
 	}
 
 	status = suunto_nautic_heatshrink_decompress (abstract->context,
