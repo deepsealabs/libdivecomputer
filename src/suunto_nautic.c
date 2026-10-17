@@ -165,6 +165,9 @@ typedef struct suunto_nautic_device_t {
 	// app's GET of a dive's /Data re-points it, and our subscription then
 	// carries that app's dive.
 	unsigned int stream_handle;
+	// The takeover was another app binding the stream handle to its own
+	// dive, i.e. it is downloading dives: wait it out, don't count it.
+	int rebound;
 } suunto_nautic_device_t;
 
 // Dive ids and their listed sizes, newest first.
@@ -339,6 +342,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 				(array_uint24_le (packet + 6) & ~0xFFu) == (device->stream_handle & ~0xFFu)) {
 				WARNING (device->base.context, "Another app took over the stream's handle (%06x).", array_uint24_le (packet + 6));
 				device->contended = 1;
+				device->rebound = 1;
 				return DC_STATUS_PROTOCOL;
 			}
 			// The watch ended our stream itself (status 404) for that session.
@@ -433,6 +437,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	device->stale_handle = 0;
 	device->yielded = 0;
 	device->stream_handle = 0;
+	device->rebound = 0;
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -859,14 +864,22 @@ suunto_nautic_yield (suunto_nautic_device_t *device, unsigned int *yields)
 	dc_device_t *abstract = (dc_device_t *) device;
 
 	device->contended = 0;
-	if (++*yields > MAX_YIELDS) {
+	// Another app downloading dives (it re-pointed our stream handle) is a
+	// deliberate sync: wait it out however many dives it takes. The cap is
+	// for everything else, e.g. an app stuck reconnecting.
+	int counted = !device->rebound;
+	device->rebound = 0;
+	if (counted && ++*yields > MAX_YIELDS) {
 		ERROR (abstract->context, "Another app took over the watch %u times; giving up.", MAX_YIELDS);
 		return DC_STATUS_TIMEOUT;
 	}
 
 	device->yielded = 1;
-	INFO (abstract->context, "Another app is using the watch; pausing until it is done (pause %u/%u).",
-		*yields, MAX_YIELDS);
+	if (counted)
+		INFO (abstract->context, "Another app is using the watch; pausing until it is done (pause %u/%u).",
+			*yields, MAX_YIELDS);
+	else
+		INFO (abstract->context, "Another app is downloading dives; pausing until it is done (not counted).");
 	device_event_emit (abstract, DC_EVENT_WAITING, NULL);
 
 	unsigned int packets = 0;
