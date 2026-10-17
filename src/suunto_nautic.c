@@ -633,6 +633,16 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffe
 			break;
 		}
 
+		// Another app's subscriptions (the Suunto app holds several) push
+		// their values on the same link, as notifications with the same
+		// opcode and sequence number as our chunks but a different handle.
+		// Compare without the slot byte: our chunks carry the handle with
+		// slot F0, the GET reply with slot 00.
+		if (chunk_len >= 3 && (array_uint24_le (chunk) & ~0xFFu) != (handle & ~0xFFu)) {
+			DEBUG (abstract->context, "Skipping a notification for another subscription (%06x).", array_uint24_le (chunk));
+			continue;
+		}
+
 		if (chunk_len < CHUNK_DATA) {
 			ERROR (abstract->context, "Unexpected chunk size (" DC_PRINTF_SIZE ").", chunk_len);
 			status = DC_STATUS_PROTOCOL;
