@@ -126,6 +126,12 @@
 #define YIELD_MAX_S    3600 // wait as long as the other app stays busy (cancellable); quiet ends it sooner
 #define MAX_YIELDS     5
 #define OPEN_LISTEN_MS 1500
+// Before our own hello, a request without one: the watch answers it only when
+// another app already has a session on the link (a fresh link stays silent).
+// Then we use that session: a hello of ours would take it over, and a Suunto
+// app that doesn't answer with a hello of its own stops getting its replies.
+#define OPEN_PROBE_MS  1500
+#define OPEN_PROBE_PATH "/Logbook/Entries"
 
 #define TIMEOUT_DEFAULT 5000
 #define TIMEOUT_STREAM  4000 // the gap between two chunks reaches about 2s
@@ -168,6 +174,8 @@ typedef struct suunto_nautic_device_t {
 	// The takeover was another app binding the stream handle to its own
 	// dive, i.e. it is downloading dives: wait it out, don't count it.
 	int rebound;
+	// Packets for other requests or streams skipped since last cleared.
+	unsigned int skipped;
 } suunto_nautic_device_t;
 
 // Dive ids and their listed sizes, newest first.
@@ -329,6 +337,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 			// it); a stream is about to be ended, so give it up.
 			if (rsp_opcode == RPC_OP_HELLO_REPLY && opcode != RPC_OP_HELLO_REPLY) {
 				WARNING (device->base.context, "Another app opened a session on the link.");
+				device->skipped++;
 				if (streaming) {
 					device->contended = 1;
 					return DC_STATUS_PROTOCOL;
@@ -353,6 +362,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 				device->contended = 1;
 				return DC_STATUS_PROTOCOL;
 			}
+			device->skipped++;
 			if (rsp_opcode == RPC_OP_NOTIFICATION) {
 				// A leftover chunk of a stream that was stopped.
 				DEBUG (device->base.context, "Skipping a stream notification.");
@@ -410,6 +420,8 @@ suunto_nautic_transfer (suunto_nautic_device_t *device, unsigned char opcode, un
 	return status;
 }
 
+static dc_status_t suunto_nautic_get (suunto_nautic_device_t *device, const char *path, unsigned int *handle, unsigned int *result);
+
 dc_status_t
 suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream_t *iostream)
 {
@@ -438,6 +450,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	device->yielded = 0;
 	device->stream_handle = 0;
 	device->rebound = 0;
+	device->skipped = 0;
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -469,10 +482,45 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 			INFO (context, "The link is quiet (%u more packets from the other app).", packets);
 		}
 	}
+	status = dc_iostream_set_timeout (device->iostream, OPEN_PROBE_MS);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (context, "Failed to set the timeout.");
+		goto error_close;
+	}
+	// The watch doesn't answer it while another client's stream is running:
+	// if other traffic arrived meanwhile, wait for quiet and ask again.
+	int shared = 0;
+	for (unsigned int round = 0; round < 2 && !shared; round++) {
+		unsigned int probe_handle = 0, probe_result = 0;
+		device->skipped = 0;
+		shared = suunto_nautic_get (device, OPEN_PROBE_PATH, &probe_handle, &probe_result) == DC_STATUS_SUCCESS;
+		if (shared || device->skipped == 0)
+			break;
+		INFO (context, "Another app is using the watch; waiting until it is done.");
+		unsigned int packets = 0;
+		status = suunto_nautic_wait_quiet (device, &packets);
+		if (status != DC_STATUS_SUCCESS)
+			goto error_close;
+		status = dc_iostream_set_timeout (device->iostream, OPEN_PROBE_MS);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (context, "Failed to set the timeout.");
+			goto error_close;
+		}
+	}
+
 	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to set the timeout.");
 		goto error_close;
+	}
+
+	if (!shared) {
+		INFO (context, "No other session on the link (the request above went unanswered, as expected); saying hello.");
+	} else {
+		INFO (context, "Another app has a session on the link; using it instead of a hello of our own.");
+		device->acknowledged = 1;
+		*out = (dc_device_t *) device;
+		return DC_STATUS_SUCCESS;
 	}
 
 	status = suunto_nautic_send (device, RPC_OP_HELLO, 0, suunto_nautic_hello, sizeof (suunto_nautic_hello));
