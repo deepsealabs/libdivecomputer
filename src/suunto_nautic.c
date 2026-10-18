@@ -344,10 +344,11 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 				}
 				continue;
 			}
-			// Another app bound our stream's handle to its own dive: from now
-			// on our subscription carries its data.
+			// Another app is using our stream's handle: a GET or SUBSCRIBE
+			// binds it to its own dive (our subscription then carries its
+			// data), an UNSUBSCRIBE ends our stream, a FETCH reads through it.
 			if (streaming && device->stream_handle && rsp_length >= 3 &&
-				(rsp_opcode == RPC_OP_GET_REPLY || rsp_opcode == RPC_OP_SUBSCRIBE_REPLY) &&
+				rsp_opcode != RPC_OP_NOTIFICATION && rsp_opcode != RPC_OP_HELLO_REPLY &&
 				(array_uint24_le (packet + 6) & ~0xFFu) == (device->stream_handle & ~0xFFu)) {
 				WARNING (device->base.context, "Another app took over the stream's handle (%06x).", array_uint24_le (packet + 6));
 				device->contended = 1;
