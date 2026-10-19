@@ -105,9 +105,6 @@
 #define ENTRY_START    0
 #define ENTRY_LENGTH   16
 
-// A /Summary is about 2.3 KB; bounds the size check when it is missing.
-#define SUMMARY_MAX_SIZE 8192
-
 // How many times to issue a dive's stream when the watch refuses it with
 // status 423 (Locked), and to download a dive whose size doesn't match the
 // listing.
@@ -985,23 +982,18 @@ suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigne
 		if (status != DC_STATUS_SUCCESS)
 			goto error_free;
 
-		// The profile is still a valid dive without the /Summary.
-		size_t summary_size = 0;
-		if (suunto_nautic_fetch_pages (device, summary_path, summary) == DC_STATUS_SUCCESS) {
-			summary_size = dc_buffer_get_size (summary);
-		} else {
-			WARNING (abstract->context, "Failed to fetch the summary of dive %u.", id);
-			dc_buffer_clear (summary);
+		status = suunto_nautic_fetch_pages (device, summary_path, summary);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to fetch the summary of dive %u.", id);
+			goto error_free;
 		}
 
 		if (listed == 0)
 			break;
 
 		size_t data_size = dc_buffer_get_size (compressed);
-		if (summary_size)
-			*incomplete = data_size + summary_size != listed;
-		else
-			*incomplete = data_size > listed || listed - data_size > SUMMARY_MAX_SIZE;
+		size_t summary_size = dc_buffer_get_size (summary);
+		*incomplete = data_size + summary_size != listed;
 		if (!*incomplete)
 			break;
 
