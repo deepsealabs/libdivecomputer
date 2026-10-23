@@ -71,20 +71,21 @@
 #define SLOT_STATIC  0xF0
 #define SLOT_UNKNOWN 0xFF
 
-// Fetch parameter types: the /Summary page offset is an int32, the
-// /Logbook/Entries start id a uint32.
+// Request parameters are COUNT(1), then TYPE(2) VALUE for each parameter. The
+// /Summary page offset is an int32, the /Logbook/Entries StartAfterId (the id
+// of the last entry received) a uint32.
 #define PARAM_INT32  0x06
 #define PARAM_UINT32 0x07
 
-// Reply payloads start with HANDLE(3) FLAGS(3) STATUS(2); a DATA reply then
-// carries the content.
+// Reply payloads start with HANDLE(3) CLIENT(3) STATUS(2), where CLIENT is
+// the 01 80 00 of the request; a DATA reply then carries the content.
 #define REPLY_STATUS  6
 #define REPLY_CONTENT 8
 
 // Stream notification payload:
-// HANDLE(3) FLAGS(3) UNKNOWN(4) OFFSET(4) LENGTH(2) UNKNOWN(6) DATA(LENGTH)
+// HANDLE(3) CLIENT(3) UNKNOWN(4) OFFSET(4) LENGTH(2) UNKNOWN(6) DATA(LENGTH) 00
 // OFFSET is the position of the chunk in the stream. The last chunk has a
-// zero length, at an offset equal to the total size.
+// zero length, at an offset equal to the total size, and is sent twice.
 #define CHUNK_OFFSET 10
 #define CHUNK_LENGTH 14
 #define CHUNK_DATA   22
@@ -94,11 +95,13 @@
 #define PAGE_HEADER 11
 #define PAGE_LENGTH 3
 
-// /Logbook/Entries is HEADER(18) RECORD(24) x COUNT, with the count at offset
-// 6 of the header. A record is START(4) END(4) UNKNOWN(8) SIZE(4) UNKNOWN(4):
-// the start time is the dive id, and the size is the compressed /Data plus
-// the /Summary data bytes. An empty logbook can omit the end of the header.
+// A /Logbook/Entries page is HEADER(18) RECORD(24) x COUNT, with the number
+// of records in the page as a uint16 at offset 6 of the header. A record is
+// ID(4) MODIFIED(4) UNKNOWN(8) SIZE(8): the id is the dive's start time, and
+// the size is the compressed /Data plus the /Summary data bytes. An empty
+// page has a 14-byte header, without the 4 padding bytes before the records.
 #define ENTRIES_HEADER 18
+#define ENTRIES_EMPTY  14
 #define ENTRIES_COUNT  6
 #define ENTRY_SIZE     24
 #define ENTRY_START    0
@@ -292,7 +295,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 }
 
 // Send a request on a handle and receive its reply: the payload is the handle
-// and its 01 80 00 resource flags, followed by the parameters, if any.
+// and the 01 80 00 client id, followed by the parameters, if any.
 static dc_status_t
 suunto_nautic_transfer (suunto_nautic_device_t *device, unsigned char opcode, unsigned char rsp_opcode,
 	unsigned int handle, const unsigned char params[], size_t nparams, unsigned char data[], size_t size, size_t *actual)
@@ -599,8 +602,8 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffe
 		goto error_unsubscribe;
 	}
 
-	// The watch streams the whole resource without acknowledgements, and
-	// repeats its last chunk until the subscription ends.
+	// The watch streams the whole resource without acknowledgements, up to
+	// the end marker.
 	dc_buffer_clear (buffer);
 	while (1) {
 		if (device_is_cancelled (abstract)) {
@@ -641,12 +644,8 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffe
 		}
 
 		size_t received = dc_buffer_get_size (buffer);
-		if (offset < received) {
-			// A repeated chunk.
-			continue;
-		}
-		if (offset > received) {
-			ERROR (abstract->context, "Missing stream data (%u " DC_PRINTF_SIZE ").", offset, received);
+		if (offset != received) {
+			ERROR (abstract->context, "Unexpected chunk offset (%u " DC_PRINTF_SIZE ").", offset, received);
 			status = DC_STATUS_PROTOCOL;
 			break;
 		}
@@ -748,6 +747,8 @@ suunto_nautic_fetch_pages (suunto_nautic_device_t *device, const char *path, dc_
 		if (result == STATUS_OK)
 			break;
 
+		// The offset didn't advance, so the next request would be the same
+		// one again.
 		if (length == 0) {
 			ERROR (abstract->context, "Empty page with more pages pending.");
 			status = DC_STATUS_PROTOCOL;
@@ -820,19 +821,22 @@ suunto_nautic_list (suunto_nautic_device_t *device, dc_buffer_t *entries)
 	if (status != DC_STATUS_SUCCESS)
 		return status;
 
+	// The first page is requested without the StartAfterId, which is
+	// optional, as the Suunto app does.
 	unsigned int last = 0;
 	for (unsigned int page = 0; ; page++) {
-		unsigned char params[7] = {0x01, PARAM_UINT32, 0x00};
-		array_uint32_le_set (params + 3, last);
+		unsigned char params[7] = {0x00, PARAM_UINT32, 0x00};
+		size_t nparams = 1;
+		if (page > 0) {
+			params[0] = 0x01;
+			array_uint32_le_set (params + 3, last);
+			nparams = sizeof (params);
+		}
 
 		unsigned char reply[MAX_PAYLOAD] = {0};
 		size_t reply_len = 0;
-		if (page == 0)
-			status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
-				handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), &reply_len);
-		else
-			status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
-				handle, params, sizeof (params), reply, sizeof (reply), &reply_len);
+		status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
+			handle, params, nparams, reply, sizeof (reply), &reply_len);
 		if (status != DC_STATUS_SUCCESS) {
 			ERROR (abstract->context, "Failed to fetch %s.", path);
 			break;
@@ -847,7 +851,7 @@ suunto_nautic_list (suunto_nautic_device_t *device, dc_buffer_t *entries)
 
 		const unsigned char *data = reply + REPLY_CONTENT;
 		size_t size = reply_len - REPLY_CONTENT;
-		if (size < ENTRIES_COUNT + 2) {
+		if (size < ENTRIES_EMPTY) {
 			ERROR (abstract->context, "Unexpected entries size (" DC_PRINTF_SIZE ").", size);
 			status = DC_STATUS_PROTOCOL;
 			break;
@@ -873,7 +877,9 @@ suunto_nautic_list (suunto_nautic_device_t *device, dc_buffer_t *entries)
 		if (result == STATUS_OK)
 			break;
 
-		if (count == 0 || last == previous) {
+		// The id didn't advance, so the next request would be the same one
+		// again.
+		if (last == previous) {
 			ERROR (abstract->context, "No new entries with more pages pending.");
 			status = DC_STATUS_PROTOCOL;
 			break;
