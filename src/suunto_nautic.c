@@ -1420,7 +1420,8 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	dc_buffer_t *entries = dc_buffer_new (0);
 	if (entries == NULL)
 		return DC_STATUS_NOMEMORY;
-	if (suunto_nautic_list (device, entries) == DC_STATUS_SUCCESS) {
+	dc_status_t status = suunto_nautic_list (device, entries);
+	if (status == DC_STATUS_SUCCESS) {
 		const unsigned char *records = dc_buffer_get_data (entries);
 		unsigned int count = dc_buffer_get_size (entries) / ENTRY_SIZE;
 		for (unsigned int i = 0; i < count; i++) {
@@ -1430,6 +1431,11 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 		}
 	}
 	dc_buffer_free (entries);
+
+	// A watch that doesn't answer the listing won't answer the download either.
+	if (status == DC_STATUS_TIMEOUT || status == DC_STATUS_IO ||
+		status == DC_STATUS_NODEVICE || status == DC_STATUS_CANCELLED)
+		return status;
 
 	int unreadable = 0;
 	return suunto_nautic_download (device, (unsigned int) id, listed, raw, &unreadable);
