@@ -116,11 +116,11 @@ suunto_nautic_device_download_summary (dc_device_t *device, const char *logbook_
  * id as it appears in a "/Logbook/byId/<id>/..." path (e.g.
  * "1787752091"). On success, `raw` holds the decoded SBEM0103 TLV
  * stream (magic-verified), suitable for suunto_nautic_parser_create(),
- * with the /Summary SBEM appended when it could be fetched.
+ * with the /Summary SBEM appended.
  *
  * The download is checked against the size /Logbook/Entries lists for the
- * id. On a mismatch it returns DC_STATUS_DATAFORMAT with the (likely
- * truncated) dive still in `raw`; on any other failure `raw` is empty.
+ * id. A download that doesn't match it, like any other failure, returns an
+ * error with `raw` empty.
  */
 dc_status_t
 suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_buffer_t *raw);
