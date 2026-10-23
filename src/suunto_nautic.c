@@ -137,14 +137,6 @@ typedef struct suunto_nautic_device_t {
 	unsigned char fingerprint[4];
 } suunto_nautic_device_t;
 
-// Dive ids and their listed sizes, newest first.
-typedef struct suunto_nautic_entries_t {
-	unsigned int *ids;
-	unsigned int *sizes;
-	unsigned int count;
-	unsigned int capacity;
-} suunto_nautic_entries_t;
-
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
 static dc_status_t suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata);
 static dc_status_t suunto_nautic_device_close (dc_device_t *abstract);
@@ -819,53 +811,17 @@ error_release:
 	return status;
 }
 
-static void
-suunto_nautic_entries_free (suunto_nautic_entries_t *entries)
-{
-	free (entries->ids);
-	free (entries->sizes);
-	memset (entries, 0, sizeof (*entries));
-}
-
-static int
-suunto_nautic_entries_add (suunto_nautic_entries_t *entries, unsigned int id, unsigned int size)
-{
-	for (unsigned int i = 0; i < entries->count; i++) {
-		if (entries->ids[i] == id)
-			return 1;
-	}
-
-	if (entries->count == entries->capacity) {
-		unsigned int capacity = entries->capacity ? entries->capacity * 2 : 32;
-		unsigned int *ids = (unsigned int *) realloc (entries->ids, capacity * sizeof (unsigned int));
-		if (ids == NULL)
-			return 0;
-		entries->ids = ids;
-		unsigned int *sizes = (unsigned int *) realloc (entries->sizes, capacity * sizeof (unsigned int));
-		if (sizes == NULL)
-			return 0;
-		entries->sizes = sizes;
-		entries->capacity = capacity;
-	}
-
-	entries->ids[entries->count] = id;
-	entries->sizes[entries->count] = size;
-	entries->count++;
-
-	return 1;
-}
-
-// List the dives, newest first. The list is served oldest first, in pages: a
-// page with status 100 is followed by a fetch for the dives after the last id
-// received, until a page with status 200.
+// List the dives: the records of all pages, oldest first. The list is served
+// in pages: a page with status 100 is followed by a fetch for the dives after
+// the last id received, until a page with status 200.
 static dc_status_t
-suunto_nautic_list (suunto_nautic_device_t *device, suunto_nautic_entries_t *entries)
+suunto_nautic_list (suunto_nautic_device_t *device, dc_buffer_t *entries)
 {
 	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
 	const char *path = "/Logbook/Entries";
 
-	memset (entries, 0, sizeof (*entries));
+	dc_buffer_clear (entries);
 
 	unsigned int handle = 0;
 	status = suunto_nautic_get_handle (device, path, &handle);
@@ -912,18 +868,15 @@ suunto_nautic_list (suunto_nautic_device_t *device, suunto_nautic_entries_t *ent
 			break;
 		}
 
-		unsigned int previous = last;
-		for (unsigned int i = 0; i < count; i++) {
-			const unsigned char *record = data + ENTRIES_HEADER + i * ENTRY_SIZE;
-			last = array_uint32_le (record + ENTRY_START);
-			if (!suunto_nautic_entries_add (entries, last, array_uint32_le (record + ENTRY_LENGTH))) {
-				ERROR (abstract->context, "Failed to allocate memory.");
-				status = DC_STATUS_NOMEMORY;
-				break;
-			}
-		}
-		if (status != DC_STATUS_SUCCESS)
+		if (!dc_buffer_append (entries, data + ENTRIES_HEADER, count * ENTRY_SIZE)) {
+			ERROR (abstract->context, "Failed to allocate memory.");
+			status = DC_STATUS_NOMEMORY;
 			break;
+		}
+
+		unsigned int previous = last;
+		if (count)
+			last = array_uint32_le (data + ENTRIES_HEADER + (count - 1) * ENTRY_SIZE + ENTRY_START);
 
 		if (result == STATUS_OK)
 			break;
@@ -939,23 +892,8 @@ suunto_nautic_list (suunto_nautic_device_t *device, suunto_nautic_entries_t *ent
 	if (rc != DC_STATUS_SUCCESS)
 		dc_status_set_error (&status, rc);
 
-	if (status != DC_STATUS_SUCCESS) {
-		suunto_nautic_entries_free (entries);
-		return status;
-	}
-
-	// Sort descending (newest first), keeping each size with its id.
-	for (unsigned int a = 1; a < entries->count; a++) {
-		unsigned int id = entries->ids[a], size = entries->sizes[a];
-		int b = (int) a - 1;
-		while (b >= 0 && entries->ids[b] < id) {
-			entries->ids[b + 1] = entries->ids[b];
-			entries->sizes[b + 1] = entries->sizes[b];
-			b--;
-		}
-		entries->ids[b + 1] = id;
-		entries->sizes[b + 1] = size;
-	}
+	if (status != DC_STATUS_SUCCESS)
+		dc_buffer_clear (entries);
 
 	return status;
 }
@@ -1177,26 +1115,34 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	progress.current = 1;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	suunto_nautic_entries_t entries;
-	status = suunto_nautic_list (device, &entries);
+	dc_buffer_t *entries = dc_buffer_new (0);
+	dc_buffer_t *buffer = dc_buffer_new (0);
+	if (entries == NULL || buffer == NULL) {
+		ERROR (abstract->context, "Failed to allocate memory.");
+		status = DC_STATUS_NOMEMORY;
+		goto error_free;
+	}
+
+	status = suunto_nautic_list (device, entries);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to list the dives.");
-		return status;
+		goto error_free;
 	}
 
-	progress.maximum = (entries.count + 1) * 2;
+	const unsigned char *records = dc_buffer_get_data (entries);
+	unsigned int count = dc_buffer_get_size (entries) / ENTRY_SIZE;
+
+	progress.maximum = (count + 1) * 2;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
-	dc_buffer_t *buffer = dc_buffer_new (0);
-	if (buffer == NULL) {
-		ERROR (abstract->context, "Failed to allocate memory.");
-		suunto_nautic_entries_free (&entries);
-		return DC_STATUS_NOMEMORY;
-	}
+	// The entries are oldest first, so process them in reverse order.
+	for (unsigned int i = count; i > 0; i--) {
+		const unsigned char *record = records + (i - 1) * ENTRY_SIZE;
+		unsigned int id = array_uint32_le (record + ENTRY_START);
+		unsigned int listed = array_uint32_le (record + ENTRY_LENGTH);
 
-	for (unsigned int i = 0; i < entries.count; i++) {
 		unsigned char fingerprint[4];
-		array_uint32_le_set (fingerprint, entries.ids[i]);
+		array_uint32_le_set (fingerprint, id);
 
 		// The dives are newest first, so everything from here on was
 		// downloaded before.
@@ -1209,17 +1155,17 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 		}
 
 		int unreadable = 0;
-		status = suunto_nautic_download (device, entries.ids[i], entries.sizes[i], buffer, &unreadable);
+		status = suunto_nautic_download (device, id, listed, buffer, &unreadable);
 		if (status != DC_STATUS_SUCCESS && unreadable) {
 			// An empty or aborted entry: listed, but without a dive.
-			WARNING (abstract->context, "Skipping dive %u without any data.", entries.ids[i]);
+			WARNING (abstract->context, "Skipping dive %u without any data.", id);
 			status = DC_STATUS_SUCCESS;
 			continue;
 		}
 		if (status != DC_STATUS_SUCCESS) {
 			// Stop here: the fingerprint of a newer dive would mark this one
 			// as downloaded.
-			ERROR (abstract->context, "Failed to download dive %u.", entries.ids[i]);
+			ERROR (abstract->context, "Failed to download dive %u.", id);
 			break;
 		}
 
@@ -1230,9 +1176,9 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 			break;
 	}
 
+error_free:
 	dc_buffer_free (buffer);
-	suunto_nautic_entries_free (&entries);
-
+	dc_buffer_free (entries);
 	return status;
 }
 
@@ -1379,22 +1325,28 @@ suunto_nautic_device_list (dc_device_t *abstract, dc_buffer_t *ids)
 	if (!suunto_nautic_is_device (abstract) || ids == NULL)
 		return DC_STATUS_INVALIDARGS;
 
-	suunto_nautic_entries_t entries;
-	dc_status_t status = suunto_nautic_list ((suunto_nautic_device_t *) abstract, &entries);
-	if (status != DC_STATUS_SUCCESS)
-		return status;
+	dc_buffer_t *entries = dc_buffer_new (0);
+	if (entries == NULL)
+		return DC_STATUS_NOMEMORY;
 
+	dc_status_t status = suunto_nautic_list ((suunto_nautic_device_t *) abstract, entries);
+	if (status != DC_STATUS_SUCCESS) {
+		dc_buffer_free (entries);
+		return status;
+	}
+
+	// The ids, newest first.
+	const unsigned char *records = dc_buffer_get_data (entries);
+	unsigned int count = dc_buffer_get_size (entries) / ENTRY_SIZE;
 	dc_buffer_clear (ids);
-	for (unsigned int i = 0; i < entries.count; i++) {
-		unsigned char id[4];
-		array_uint32_le_set (id, entries.ids[i]);
-		if (!dc_buffer_append (ids, id, sizeof (id))) {
+	for (unsigned int i = count; i > 0; i--) {
+		if (!dc_buffer_append (ids, records + (i - 1) * ENTRY_SIZE + ENTRY_START, 4)) {
 			status = DC_STATUS_NOMEMORY;
 			break;
 		}
 	}
 
-	suunto_nautic_entries_free (&entries);
+	dc_buffer_free (entries);
 	return status;
 }
 
@@ -1467,14 +1419,19 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	// The listed size to check the download against; a dive that isn't
 	// listed is downloaded without the check.
 	unsigned int listed = 0;
-	suunto_nautic_entries_t entries;
-	if (suunto_nautic_list (device, &entries) == DC_STATUS_SUCCESS) {
-		for (unsigned int i = 0; i < entries.count; i++) {
-			if (entries.ids[i] == id)
-				listed = entries.sizes[i];
+	dc_buffer_t *entries = dc_buffer_new (0);
+	if (entries == NULL)
+		return DC_STATUS_NOMEMORY;
+	if (suunto_nautic_list (device, entries) == DC_STATUS_SUCCESS) {
+		const unsigned char *records = dc_buffer_get_data (entries);
+		unsigned int count = dc_buffer_get_size (entries) / ENTRY_SIZE;
+		for (unsigned int i = 0; i < count; i++) {
+			const unsigned char *record = records + i * ENTRY_SIZE;
+			if (array_uint32_le (record + ENTRY_START) == id)
+				listed = array_uint32_le (record + ENTRY_LENGTH);
 		}
-		suunto_nautic_entries_free (&entries);
 	}
+	dc_buffer_free (entries);
 
 	int unreadable = 0;
 	return suunto_nautic_download (device, (unsigned int) id, listed, raw, &unreadable);
