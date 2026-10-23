@@ -233,7 +233,10 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 					goto out;
 				}
 
-				if (initialized) {
+				// Two flags in a row (one frame's closing flag, the next one's
+				// opening flag) delimit no frame: stay in sync and start the
+				// next frame here, rather than return an empty one.
+				if (initialized && nbytes) {
 					goto out;
 				}
 
