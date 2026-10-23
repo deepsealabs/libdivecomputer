@@ -30,7 +30,8 @@
  *     (checksum_crc32r) of every preceding byte. A reply echoes the
  *     request's sequence number. The watch serves every app connected to
  *     it over the same link, so replies to another app's requests are
- *     recognized by their sequence number and skipped.
+ *     recognized by their sequence number and skipped, as are leftover
+ *     notifications of a stream that has ended.
  *   - A GET (0x0A) resolves a path to a handle; the other requests (FETCH
  *     0x0D, SUBSCRIBE 0x10, UNSUBSCRIBE 0x11, RELEASE 0x0B) address that
  *     handle. A per-dive handle stays bound until it is released.
