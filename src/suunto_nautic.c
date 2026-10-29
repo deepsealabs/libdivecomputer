@@ -95,10 +95,12 @@
 #define PAGE_HEADER 11
 #define PAGE_LENGTH 3
 
-// A /Logbook/Entries page is HEADER(18) RECORD(24) x COUNT, with the number
-// of records in the page as a uint16 at offset 6 of the header. A record is
-// ID(4) MODIFIED(4) UNKNOWN(8) SIZE(8): the id is the dive's start time, and
-// the size is the compressed /Data plus the /Summary data bytes. An empty
+// A /Logbook/Entries page is exactly HEADER(18) RECORD(24) x COUNT, with the
+// number of records in the page as a uint16 at offset 6 of the header. A
+// record is ID(4) MODIFIED(4) 01 PADDING(7) SIZE(8), the LogEntry of the
+// Movesense logbook API, in which the size is optional and the 01 marks it as
+// present. The id is the dive's start time, and the size is the compressed
+// /Data plus the /Summary data bytes, which fits in its low 4 bytes. An empty
 // page has a 14-byte header, without the 4 padding bytes before the records.
 #define ENTRIES_HEADER 18
 #define ENTRIES_EMPTY  14
@@ -858,7 +860,7 @@ suunto_nautic_list (suunto_nautic_device_t *device, dc_buffer_t *entries)
 		}
 
 		unsigned int count = array_uint16_le (data + ENTRIES_COUNT);
-		if (count && ENTRIES_HEADER + count * ENTRY_SIZE > size) {
+		if (count && ENTRIES_HEADER + count * ENTRY_SIZE != size) {
 			ERROR (abstract->context, "Unexpected number of entries (%u " DC_PRINTF_SIZE ").", count, size);
 			status = DC_STATUS_PROTOCOL;
 			break;
