@@ -94,8 +94,9 @@
 #define CHUNK_LENGTH 14
 #define CHUNK_DATA   22
 
-// A /Summary page is HEADER(11) DATA, with the data length at offset 3 of
-// the header. The paging offset counts data bytes only.
+// A page of a paged resource (/Summary, or /Data read with a FETCH) is
+// HEADER(11) DATA, with the data length at offset 3 of the header. The paging
+// offset counts data bytes only, so for /Data it is the stream offset.
 #define PAGE_HEADER 11
 #define PAGE_LENGTH 3
 
@@ -114,7 +115,7 @@
 #define ENTRY_LENGTH   16
 
 // How many times to issue a dive's stream when it fails with a protocol error
-// (e.g. status 423 (Locked), or a lost chunk) or stops before its end marker,
+// (e.g. status 423 (Locked)) or stops before its end marker,
 // and to download a dive whose size doesn't match the listing.
 #define STREAM_ATTEMPTS   3
 #define DOWNLOAD_ATTEMPTS 2
@@ -568,18 +569,89 @@ done:
 	return status;
 }
 
+// Read the pages of a resource on a handle bound by a GET, from the offset
+// of the data already in the buffer, and append their data. Each page is
+// requested by the offset of its data, and the last page has status 200.
+static dc_status_t
+suunto_nautic_read_pages (suunto_nautic_device_t *device, const char *path, unsigned int handle, dc_buffer_t *buffer)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	unsigned int offset = dc_buffer_get_size (buffer);
+	while (1) {
+		if (device_is_cancelled (abstract)) {
+			status = DC_STATUS_CANCELLED;
+			break;
+		}
+
+		unsigned char params[7] = {0x01, PARAM_INT32, 0x00};
+		array_uint32_le_set (params + 3, offset);
+
+		unsigned char reply[MAX_PAYLOAD] = {0};
+		size_t reply_len = 0;
+		status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
+			handle, params, sizeof (params), reply, sizeof (reply), &reply_len);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to fetch %s (offset %u).", path, offset);
+			break;
+		}
+
+		unsigned int result = array_uint16_le (reply + REPLY_STATUS);
+		if (result != STATUS_OK && result != STATUS_CONTINUE) {
+			ERROR (abstract->context, "Failed to fetch %s (status %u).", path, result);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		if (reply_len < REPLY_CONTENT + PAGE_HEADER) {
+			ERROR (abstract->context, "Unexpected page size (" DC_PRINTF_SIZE ").", reply_len);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		unsigned int length = array_uint16_le (reply + REPLY_CONTENT + PAGE_LENGTH);
+		if (REPLY_CONTENT + PAGE_HEADER + length > reply_len) {
+			ERROR (abstract->context, "Unexpected page length (%u " DC_PRINTF_SIZE ").", length, reply_len);
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+
+		if (!dc_buffer_append (buffer, reply + REPLY_CONTENT + PAGE_HEADER, length)) {
+			ERROR (abstract->context, "Failed to allocate memory.");
+			status = DC_STATUS_NOMEMORY;
+			break;
+		}
+		offset += length;
+
+		if (result == STATUS_OK)
+			break;
+
+		// The offset didn't advance, so the next request would be the same
+		// one again.
+		if (length == 0) {
+			ERROR (abstract->context, "Empty page with more pages pending.");
+			status = DC_STATUS_PROTOCOL;
+			break;
+		}
+	}
+
+	return status;
+}
+
 // Download a streamed resource (the dive profile): GET, SUBSCRIBE, the
 // notifications up to the end marker, UNSUBSCRIBE and RELEASE. Returns the
 // still compressed stream. Returns DC_STATUS_PROTOCOL on a protocol error,
 // e.g. when the watch refuses the stream (status 423 while the previous
-// stream's handle is still bound) or a chunk is missing, and
-// DC_STATUS_TIMEOUT when the stream stops before its end marker.
+// stream's handle is still bound) or a chunk arrives at an earlier offset,
+// and DC_STATUS_TIMEOUT when the stream stops before its end marker.
 static dc_status_t
 suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
 {
 	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
 	dc_status_t rc = DC_STATUS_SUCCESS;
+	int missing = 0;
 
 	unsigned int handle = 0;
 	status = suunto_nautic_get_handle (device, path, &handle);
@@ -646,7 +718,15 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffe
 			break;
 		}
 
+		// A lost chunk isn't sent again: the next one just arrives at a later
+		// offset. The rest is read in pages, after the UNSUBSCRIBE.
 		size_t received = dc_buffer_get_size (buffer);
+		if (offset > received) {
+			WARNING (abstract->context, "Missing stream data (%u " DC_PRINTF_SIZE "), reading the rest in pages.", offset, received);
+			missing = 1;
+			break;
+		}
+
 		if (offset != received) {
 			ERROR (abstract->context, "Unexpected chunk offset (%u " DC_PRINTF_SIZE ").", offset, received);
 			status = DC_STATUS_PROTOCOL;
@@ -685,6 +765,11 @@ error_unsubscribe:
 		dc_status_set_error (&status, rc);
 	}
 
+	// The handle serves the same resource in pages too, from any offset, which
+	// is how the Suunto app reads the rest of a stream with a gap.
+	if (missing && status == DC_STATUS_SUCCESS)
+		status = suunto_nautic_read_pages (device, path, handle, buffer);
+
 error_release:
 	rc = suunto_nautic_release (device, handle);
 	if (rc != DC_STATUS_SUCCESS)
@@ -692,12 +777,10 @@ error_release:
 	return status;
 }
 
-// Read a paged resource (/Summary). Each page is requested by the offset of
-// its data, and the last page has status 200.
+// Read a paged resource (/Summary).
 static dc_status_t
 suunto_nautic_fetch_pages (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
 {
-	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
 
 	unsigned int handle = 0;
@@ -706,58 +789,7 @@ suunto_nautic_fetch_pages (suunto_nautic_device_t *device, const char *path, dc_
 		return status;
 
 	dc_buffer_clear (buffer);
-	unsigned int offset = 0;
-	while (1) {
-		unsigned char params[7] = {0x01, PARAM_INT32, 0x00};
-		array_uint32_le_set (params + 3, offset);
-
-		unsigned char reply[MAX_PAYLOAD] = {0};
-		size_t reply_len = 0;
-		status = suunto_nautic_transfer (device, RPC_OP_FETCH, RPC_OP_DATA,
-			handle, params, sizeof (params), reply, sizeof (reply), &reply_len);
-		if (status != DC_STATUS_SUCCESS) {
-			ERROR (abstract->context, "Failed to fetch %s (offset %u).", path, offset);
-			break;
-		}
-
-		unsigned int result = array_uint16_le (reply + REPLY_STATUS);
-		if (result != STATUS_OK && result != STATUS_CONTINUE) {
-			ERROR (abstract->context, "Failed to fetch %s (status %u).", path, result);
-			status = DC_STATUS_PROTOCOL;
-			break;
-		}
-
-		if (reply_len < REPLY_CONTENT + PAGE_HEADER) {
-			ERROR (abstract->context, "Unexpected page size (" DC_PRINTF_SIZE ").", reply_len);
-			status = DC_STATUS_PROTOCOL;
-			break;
-		}
-
-		unsigned int length = array_uint16_le (reply + REPLY_CONTENT + PAGE_LENGTH);
-		if (REPLY_CONTENT + PAGE_HEADER + length > reply_len) {
-			ERROR (abstract->context, "Unexpected page length (%u " DC_PRINTF_SIZE ").", length, reply_len);
-			status = DC_STATUS_PROTOCOL;
-			break;
-		}
-
-		if (!dc_buffer_append (buffer, reply + REPLY_CONTENT + PAGE_HEADER, length)) {
-			ERROR (abstract->context, "Failed to allocate memory.");
-			status = DC_STATUS_NOMEMORY;
-			break;
-		}
-		offset += length;
-
-		if (result == STATUS_OK)
-			break;
-
-		// The offset didn't advance, so the next request would be the same
-		// one again.
-		if (length == 0) {
-			ERROR (abstract->context, "Empty page with more pages pending.");
-			status = DC_STATUS_PROTOCOL;
-			break;
-		}
-	}
+	status = suunto_nautic_read_pages (device, path, handle, buffer);
 
 	dc_status_t rc = suunto_nautic_release (device, handle);
 	if (rc != DC_STATUS_SUCCESS)
