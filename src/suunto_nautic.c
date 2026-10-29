@@ -291,7 +291,9 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 }
 
 // Send a request on a handle and receive its reply: the payload is the handle
-// and the 01 80 00 client id, followed by the parameters, if any.
+// and the 01 80 00 client id, followed by the parameters, if any. The reply
+// is checked to hold at least HANDLE(3) CLIENT(3) STATUS(2), so the caller
+// can read the status before it checks the size of the content.
 static dc_status_t
 suunto_nautic_transfer (suunto_nautic_device_t *device, unsigned char opcode, unsigned char rsp_opcode,
 	unsigned int handle, const unsigned char params[], size_t nparams, unsigned char data[], size_t size, size_t *actual)
@@ -437,7 +439,7 @@ suunto_nautic_release (suunto_nautic_device_t *device, unsigned int handle)
 	return status;
 }
 
-// Resolve a path to a handle. The GET reply is HANDLE(3) FLAGS(3) STATUS(2).
+// Resolve a path to a handle. The GET reply is HANDLE(3) CLIENT(3) STATUS(2).
 static dc_status_t
 suunto_nautic_get_handle (suunto_nautic_device_t *device, const char *path, unsigned int *handle)
 {
