@@ -66,8 +66,10 @@
 // second GET while the 00 slot is still bound, e.g. by another app on the
 // link, gets the 10 slot; the handle the GET returns is always the one used.
 // Static paths answer with an F0 handle and an unknown path with FF FF FF;
-// neither is released. The slot is the first byte on the wire.
-#define HANDLE_SLOT(handle) ((handle) & 0xFF)
+// neither is released. The slot is the first byte on the wire, the resource
+// the other two.
+#define HANDLE_SLOT(handle)     ((handle) & 0xFF)
+#define HANDLE_RESOURCE(handle) ((handle) >> 8)
 #define SLOT_STATIC  0xF0
 #define SLOT_UNKNOWN 0xFF
 
@@ -84,8 +86,10 @@
 
 // Stream notification payload:
 // HANDLE(3) CLIENT(3) UNKNOWN(4) OFFSET(4) LENGTH(2) UNKNOWN(6) DATA(LENGTH) 00
-// OFFSET is the position of the chunk in the stream. The last chunk has a
-// zero length, at an offset equal to the total size, and is sent twice.
+// HANDLE is the static handle of the resource (F0 24 0E for /Data), not the
+// slot the GET returned. OFFSET is the position of the chunk in the stream.
+// The last chunk has a zero length, at an offset equal to the total size, and
+// is sent twice.
 #define CHUNK_OFFSET 10
 #define CHUNK_LENGTH 14
 #define CHUNK_DATA   22
@@ -621,13 +625,10 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, dc_buffe
 			break;
 		}
 
-		// Another app's subscriptions (the Suunto app holds several) push
-		// their values on the same link, as notifications with the same
-		// opcode and sequence number as our chunks but a different handle.
-		// Compare without the slot byte: our chunks carry the handle with
-		// slot F0, the GET reply with slot 00.
-		if (chunk_len >= 3 && (array_uint24_le (chunk) & ~0xFFu) != (handle & ~0xFFu)) {
-			DEBUG (abstract->context, "Skipping a notification for another subscription (%06x).", array_uint24_le (chunk));
+		// The values of another app's subscriptions (the Suunto app holds
+		// several) arrive as notifications too, for another resource.
+		if (chunk_len >= 3 && HANDLE_RESOURCE (array_uint24_le (chunk)) != HANDLE_RESOURCE (handle)) {
+			WARNING (abstract->context, "Skipping a notification for another resource (%06x).", array_uint24_le (chunk));
 			continue;
 		}
 
