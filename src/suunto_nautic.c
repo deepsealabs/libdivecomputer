@@ -958,6 +958,7 @@ suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigne
 
 	size_t data_size = dc_buffer_get_size (compressed);
 	size_t summary_size = dc_buffer_get_size (summary);
+	// Fork only: the by-id download passes 0 for a dive that isn't listed.
 	if (listed && data_size + summary_size != listed) {
 		ERROR (abstract->context, "Unexpected size of dive %u (" DC_PRINTF_SIZE " + " DC_PRINTF_SIZE " bytes, listed %u).",
 			id, data_size, summary_size, listed);
@@ -1147,6 +1148,15 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 		if (device_is_cancelled (abstract)) {
 			status = DC_STATUS_CANCELLED;
 			break;
+		}
+
+		// An entry listed with a size of zero has no data to download, so
+		// skipping it loses nothing.
+		if (listed == 0) {
+			WARNING (abstract->context, "Skipping empty dive %u.", id);
+			progress.current += 2;
+			device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+			continue;
 		}
 
 		status = suunto_nautic_download (device, id, listed, buffer);
