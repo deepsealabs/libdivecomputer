@@ -31,8 +31,8 @@
  * Decoded chunks: 0x12 (1Hz absolute pressure / temperature), 0x16
  * (depth, cylinder pressures, gas time remaining, NDL, time-to-surface),
  * 0x17 (surface pressure), 0x0B (GPS), 0x0F (heart rate, Ocean only),
- * 0x08 (activity -> dive mode), plus the dynamically-assigned dive-event
- * subgroups. Chunks 0x0E (satellite
+ * 0x08 (activity -> dive mode), 0x20 (CCR setpoint switch, Nautic only),
+ * plus the dynamically-assigned dive-event subgroups. Chunks 0x0E (satellite
  * info) and 0x14 (battery) have fixed lengths that are used for resync
  * (see suunto_nautic_sbem_fixed_length) but map to no dc_field/dc_sample
  * and are not otherwise decoded. Chunks 0x23/0x24 are raw accelerometer /
@@ -110,6 +110,14 @@
 #define CHUNK_DIVE_STATUS     0x1E // [timeDelta:2][active:1]; the DiveActive flag
 #define CHUNK_OOAM            0x1D // [timeDelta:2][type:1]; one-shot dive-end reason (Ooam.Type)
 #define CHUNK_GAS_SWITCH      0x1F // [timeDelta:2][gasnumber:int16 LE]
+// Sample.DiveEvents.SetpointSwitch: [timeDelta:2][PO2:float32 LE, bar][Mode:1],
+// Mode 0 Automatic, 1 Low, 2 High, 3 Custom. The id is the one a Nautic CCR
+// dive (firmware 2.55.46) assigned in its Descriptors, which the parser doesn't
+// have, so it is only decoded on a dive the /Summary marks as CCR.
+#define CHUNK_SETPOINT_SWITCH 0x20
+#define SETPOINT_MODE_CUSTOM  3
+// A setpoint at or above this (bar) is not a value the watch would log.
+#define SETPOINT_MAX          3.0
 
 // DiveState values (CHUNK_DIVE_STATE payload).
 #define DIVE_STATE_IDLING     0
@@ -132,17 +140,30 @@
 #define SUMMARY_WATER_TYPE 0x3E
 // Gas/cylinder records: an array starting at SUMMARY_GAS_BASE, one 45-byte
 // record per configured gas. The record index equals the cylinder slot /
-// GasNumber, so tank i uses gas i. Within a record: O2% (int16 LE) at +1,
-// He% (int16 LE) at +3, PO2-max (float32 LE, bar) at +5, cylinder water
-// capacity (float32 LE, m^3) at +9, as the watch's own /Summary schema lays
-// them out. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
-// transmitters -- issue #29/#33/#34); a lone gas dive stops at the first
-// implausible slot, as before.
+// GasNumber, so tank i uses gas i. Within a record: State (enum) at +0, O2%
+// (int16 LE) at +1, He% (int16 LE) at +3, PO2-max (float32 LE, bar) at +5,
+// cylinder water capacity (float32 LE, m^3) at +9, as the watch's own /Summary
+// schema lays them out. Confirmed on two real dual-gas dives (Air 12 L + NX26
+// 5.7 L, two transmitters -- issue #29/#33/#34); a lone gas dive stops at the
+// first implausible slot, as before.
 #define SUMMARY_GAS_BASE   0xC7
 #define SUMMARY_GAS_STRIDE 45
+#define SUMMARY_GAS_STATE  0  // enum: 0 OC, 1 CCR diluent, 2 CCR oxygen, 3 suit
 #define SUMMARY_GAS_O2     1  // int16 LE, %
 #define SUMMARY_GAS_HE     3  // int16 LE, %
 #define SUMMARY_GAS_VOLUME 9  // float32 LE, m^3
+#define GAS_STATE_DILUENT  1
+#define GAS_STATE_OXYGEN   2
+// The Nautic's DiveHeader (the first /Summary record, 561 bytes) ends in a
+// 16-byte CCR setpoint block: Low and High (float32 LE, Pa), SwitchDepthLow and
+// SwitchDepthHigh (int8, m), SetpointIsAutomatic and SetpointIsCustom (bool),
+// Custom (float32 LE, Pa). It is zero on open-circuit dives, and the Ocean's
+// shorter DiveHeader has none. A dive starts on the low setpoint, with no
+// SetpointSwitch record for it. The automatic switch depths have no
+// libdivecomputer field; the switches themselves are logged as SetpointSwitch.
+#define SUMMARY_HEADER_RECORD       0
+#define SUMMARY_HEADER_SETPOINT_LOW 545
+#define SUMMARY_HEADER_SETPOINT_END 561
 // The dive record, the last /Summary record long enough to hold these, carries
 // the watch's own dive time and maximum depth (the app's DiveTime and
 // Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries,
@@ -194,11 +215,13 @@ typedef struct suunto_nautic_parser_t {
 	double atmospheric; // bar
 	unsigned int have_datetime;
 	dc_ticks_t datetime; // dive start, UNIX seconds
-	dc_divemode_t divemode; // from the CHUNK_ACTIVITY sport id; OC unless apnea
+	dc_divemode_t divemode; // apnea from the CHUNK_ACTIVITY sport id, else CCR from the gas states, else OC
 	// From the /Summary SBEM section appended after the profile, if present.
 	unsigned int ngasmixes;
 	dc_gasmix_t gasmix[MAX_GASMIXES];
 	double gasvolume[MAX_GASMIXES]; // cylinder water capacity, litres (0 = unknown)
+	unsigned int ccr;  // a gas is a CCR diluent or oxygen
+	double setpoint;   // the low setpoint the dive starts on, bar (0 = unknown)
 	unsigned int have_decomodel;
 	dc_decomodel_t decomodel;
 	unsigned int have_salinity;
@@ -405,11 +428,12 @@ suunto_nautic_summary_dive_record (const unsigned char *sbem, size_t size)
 	return record;
 }
 
-// Parse gradient factors and gas mixes from the /Summary section, whose
-// "SBEM0103" signature is at `sbem` (length `size`). Offsets are relative
-// to that signature (confirmed on real hardware). Gases are validated by
-// plausibility (O2 in 1..100, He in 0..100-O2) and counted until the first
-// implausible slot, since unused slots hold unrelated bytes.
+// Parse gradient factors, gas mixes and the CCR setup from the /Summary
+// section, whose "SBEM0103" signature is at `sbem` (length `size`). Offsets
+// are relative to that signature (confirmed on real hardware). Gases are
+// validated by plausibility (O2 in 1..100, He in 0..100-O2) and counted until
+// the first implausible slot, since unused slots hold unrelated bytes. A gas
+// whose State is CCR diluent or oxygen makes the dive CCR.
 static void
 suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char *sbem, size_t size)
 {
@@ -442,10 +466,18 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 		if (o2 < 1 || o2 > 100 || he < 0 || he > 100 || o2 + he > 100)
 			break; // unused/implausible slot -- stop
 		unsigned int g = parser->ngasmixes;
+		unsigned int state = sbem[base + SUMMARY_GAS_STATE];
 		parser->gasmix[g].oxygen = o2 / 100.0;
 		parser->gasmix[g].helium = he / 100.0;
 		parser->gasmix[g].nitrogen = 1.0 - (o2 + he) / 100.0;
-		parser->gasmix[g].usage = DC_USAGE_NONE;
+		if (state == GAS_STATE_DILUENT)
+			parser->gasmix[g].usage = DC_USAGE_DILUENT;
+		else if (state == GAS_STATE_OXYGEN)
+			parser->gasmix[g].usage = DC_USAGE_OXYGEN;
+		else
+			parser->gasmix[g].usage = DC_USAGE_NONE;
+		if (parser->gasmix[g].usage != DC_USAGE_NONE)
+			parser->ccr = 1;
 		// Per-gas cylinder water capacity (float32 m^3) -> litres, when the
 		// record's volume field is present and physically sane.
 		if (base + SUMMARY_GAS_VOLUME + 4 <= size) {
@@ -454,6 +486,14 @@ suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char
 				parser->gasvolume[g] = vol_m3 * 1000.0;
 		}
 		parser->ngasmixes++;
+	}
+
+	size_t length = 0;
+	const unsigned char *header = suunto_nautic_summary_record (sbem, size, SUMMARY_HEADER_RECORD, &length);
+	if (parser->ccr && header && length >= SUMMARY_HEADER_SETPOINT_END) {
+		double low = array_float_le (header + SUMMARY_HEADER_SETPOINT_LOW) / 100000.0;
+		if (low > 0.0 && low < SETPOINT_MAX)
+			parser->setpoint = low;
 	}
 }
 
@@ -527,8 +567,32 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 	// The profile (/Data) is the first SBEM section; an optional /Summary
 	// section (gradient factors, gas mix) is appended after it. Walk only
-	// the profile here; parse /Summary separately below.
+	// the profile below; the /Summary is parsed separately.
 	size_t profile_size = suunto_nautic_find_summary (abstract->data, abstract->size);
+
+	// Gradient factors, gas mixes and the CCR setup from the appended
+	// /Summary section, read first because the profile needs to know
+	// whether the dive is CCR.
+	parser->ngasmixes = 0;
+	parser->have_decomodel = 0;
+	parser->have_salinity = 0;
+	parser->ccr = 0;
+	parser->setpoint = 0.0;
+	memset (&parser->salinity, 0, sizeof (parser->salinity));
+	memset (parser->gasmix, 0, sizeof (parser->gasmix));
+	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
+	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
+	if (profile_size < abstract->size)
+		suunto_nautic_parse_summary (parser, abstract->data + profile_size, abstract->size - profile_size);
+
+	// The dive starts on the low setpoint, which no SetpointSwitch records.
+	if (callback && parser->ccr && parser->setpoint > 0.0) {
+		dc_sample_value_t sample = {0};
+		sample.time = 0;
+		callback (DC_SAMPLE_TIME, &sample, userdata);
+		sample.setpoint = parser->setpoint;
+		callback (DC_SAMPLE_SETPOINT, &sample, userdata);
+	}
 
 	unsigned int offset = SBEM_MAGIC_SIZE;
 	// Time is delta-encoded: every chunk (except the timeline base 0x01)
@@ -587,10 +651,11 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 
 	unsigned int have_datetime = 0;
 
-	// Open circuit unless a CHUNK_ACTIVITY sport id says the dive was apnea.
-	// The Nautic/Ocean are recreational OC computers (no CCR/SCR), and with no
-	// activity chunk at all OC is the right default -- far better than the
-	// dc_divemode_t zero value (freedive) a missing field leaves behind.
+	// Open circuit unless a CHUNK_ACTIVITY sport id says the dive was apnea
+	// (CCR comes from the /Summary gas states; the sport id stays scuba on a
+	// CCR dive). With no activity chunk at all OC is the right default -- far
+	// better than the dc_divemode_t zero value (freedive) a missing field
+	// leaves behind.
 	dc_divemode_t divemode = DC_DIVEMODE_OC;
 
 	// GPS horizontal/vertical position error, int8-delta-accumulated (chunk 0x0E).
@@ -873,6 +938,20 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 				sample.event.value = (unsigned int) gasnum;
 				callback (DC_SAMPLE_EVENT, &sample, userdata);
 			}
+		} else if (chunk.id == CHUNK_SETPOINT_SWITCH && parser->ccr && chunk.size >= 7) {
+			// [timeDelta:2][PO2:float32 LE, bar][Mode:1]. Manual and automatic
+			// switches alike; the PO2 is the new setpoint. The Notify "Setpoint
+			// switch" (type 21) only tracks the on-screen message and isn't
+			// logged for every switch, so it stays a plain event.
+			double po2 = array_float_le (chunk.data + 2);
+			unsigned int mode = chunk.data[6];
+			if (po2 > 0.0 && po2 < SETPOINT_MAX && mode <= SETPOINT_MODE_CUSTOM && callback) {
+				dc_sample_value_t sample = {0};
+				sample.time = (unsigned int) time_ms;
+				callback (DC_SAMPLE_TIME, &sample, userdata);
+				sample.setpoint = po2;
+				callback (DC_SAMPLE_SETPOINT, &sample, userdata);
+			}
 		} else if (chunk.id == CHUNK_HEARTRATE && chunk.size >= 3) {
 			// [timeDelta:2][hr:uint8 bpm]. Optical wrist HR, present only on
 			// the Suunto Ocean (the Nautic / Nautic S have no HR sensor, so
@@ -990,20 +1069,12 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->have_atmospheric = have_atmospheric;
 	parser->atmospheric = atmospheric;
 	parser->have_datetime = have_datetime;
-	parser->divemode = divemode;
+	// An apnea sport id wins over leftover CCR gases.
+	parser->divemode = (divemode == DC_DIVEMODE_OC && parser->ccr) ? DC_DIVEMODE_CCR : divemode;
 
-	// Gradient factors and gas mixes from the appended /Summary section.
-	parser->ngasmixes = 0;
-	parser->have_decomodel = 0;
-	parser->have_salinity = 0;
-	memset (&parser->salinity, 0, sizeof (parser->salinity));
-	memset (parser->gasmix, 0, sizeof (parser->gasmix));
-	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
-	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
 	if (profile_size < abstract->size) {
 		const unsigned char *sbem = abstract->data + profile_size;
 		size_t sbem_size = abstract->size - profile_size;
-		suunto_nautic_parse_summary (parser, sbem, sbem_size);
 
 		// The watch's maximum is deeper than any logged sample (the app shows
 		// it). Trusted only on a record whose dive time agrees with the
@@ -1139,11 +1210,12 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		tank->gasmix = DC_GASMIX_UNKNOWN;
 		tank->usage = DC_USAGE_NONE;
 		// Link the tank to its gas (slot index) and expose the per-gas
-		// cylinder size from the /Summary when both are known.
+		// cylinder size and CCR role from the /Summary when both are known.
 		{
 			unsigned int gi = parser->tank[flags].gasmix;
 			if (gi < parser->ngasmixes) {
 				tank->gasmix = gi;
+				tank->usage = parser->gasmix[gi].usage;
 				if (parser->gasvolume[gi] > 0.0) {
 					tank->type = DC_TANKVOLUME_METRIC;
 					tank->volume = parser->gasvolume[gi];
