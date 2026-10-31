@@ -114,6 +114,16 @@
 #define ENTRY_START    0
 #define ENTRY_LENGTH   16
 
+// Fork only: the downloads carried over to a later connection. The resume
+// buffer holds a record per dive, ID(4) LISTED(4) SIZE(4) DATA(SIZE): the
+// dive, its listed size and the compressed /Data received before its
+// download failed. The records are oldest first, at most RESUME_MAX.
+#define RESUME_ID     0
+#define RESUME_LISTED 4
+#define RESUME_SIZE   8
+#define RESUME_HEADER 12
+#define RESUME_MAX    4
+
 #define TIMEOUT_DEFAULT 5000
 #define TIMEOUT_STREAM  4000 // the gap between two chunks reaches about 2s
 
@@ -136,6 +146,9 @@ typedef struct suunto_nautic_device_t {
 	// The dive id (a UNIX timestamp) of the most recently downloaded dive,
 	// little-endian. All-zero means no fingerprint.
 	unsigned char fingerprint[4];
+	// Fork only: the caller's buffer that carries a failed download over to
+	// a later connection (extension API), or NULL.
+	dc_buffer_t *resume;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -354,6 +367,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		device->seqnum = g_suunto_nautic_seqnum;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 	device->acknowledged = 0;
+	device->resume = NULL;
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -788,6 +802,223 @@ suunto_nautic_fetch_pages (suunto_nautic_device_t *device, const char *path, dc_
 	return status;
 }
 
+// Fork only: read the rest of a /Data stream that an earlier connection
+// didn't finish, in pages from the first missing byte, on the handle of a new
+// GET. After a lost link the watch binds the same handle again and serves the
+// pages from any offset, as it does after a lost chunk.
+static dc_status_t
+suunto_nautic_resume_pages (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
+{
+	unsigned int handle = 0;
+	dc_status_t status = suunto_nautic_get_handle (device, path, &handle);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	status = suunto_nautic_read_pages (device, path, handle, buffer);
+
+	dc_status_t rc = suunto_nautic_release (device, handle);
+	if (rc != DC_STATUS_SUCCESS)
+		dc_status_set_error (&status, rc);
+	return status;
+}
+
+// Fork only: the failures after which the /Data received so far is still
+// right, so a later connection can carry on from it: the link went, or the
+// download was cancelled.
+static int
+suunto_nautic_resumable (dc_status_t status)
+{
+	return status == DC_STATUS_TIMEOUT || status == DC_STATUS_IO ||
+		status == DC_STATUS_NODEVICE || status == DC_STATUS_CANCELLED;
+}
+
+// Fork only: find the record of a dive in the resume buffer, and count the
+// records. A buffer that doesn't parse as records is emptied.
+static int
+suunto_nautic_resume_find (dc_buffer_t *resume, unsigned int id, size_t *offset, unsigned int *count)
+{
+	const unsigned char *data = dc_buffer_get_data (resume);
+	size_t size = dc_buffer_get_size (resume);
+	size_t position = 0;
+	unsigned int n = 0;
+	int found = 0;
+
+	while (size - position >= RESUME_HEADER) {
+		size_t length = array_uint32_le (data + position + RESUME_SIZE);
+		if (length > size - position - RESUME_HEADER)
+			break;
+		if (!found && array_uint32_le (data + position + RESUME_ID) == id) {
+			*offset = position;
+			found = 1;
+		}
+		position += RESUME_HEADER + length;
+		n++;
+	}
+
+	if (position != size) {
+		dc_buffer_clear (resume);
+		found = 0;
+		n = 0;
+	}
+
+	if (count)
+		*count = n;
+	return found;
+}
+
+// Fork only: remove the record at the offset from the resume buffer.
+static void
+suunto_nautic_resume_remove (dc_buffer_t *resume, size_t offset)
+{
+	unsigned char *data = dc_buffer_get_data (resume);
+	size_t size = dc_buffer_get_size (resume);
+	size_t length = RESUME_HEADER + array_uint32_le (data + offset + RESUME_SIZE);
+
+	memmove (data + offset, data + offset + length, size - offset - length);
+	dc_buffer_resize (resume, size - length);
+}
+
+// Fork only: forget what was kept for a dive.
+static void
+suunto_nautic_resume_forget (suunto_nautic_device_t *device, unsigned int id)
+{
+	size_t offset = 0;
+
+	if (device->resume && suunto_nautic_resume_find (device->resume, id, &offset, NULL))
+		suunto_nautic_resume_remove (device->resume, offset);
+}
+
+// Fork only: put the /Data an earlier connection kept for this dive in the
+// buffer. Returns its size, 0 when nothing was kept.
+static size_t
+suunto_nautic_resume_load (suunto_nautic_device_t *device, unsigned int id, unsigned int listed, dc_buffer_t *buffer)
+{
+	dc_buffer_t *resume = device->resume;
+	size_t offset = 0;
+
+	if (resume == NULL || listed == 0 || !suunto_nautic_resume_find (resume, id, &offset, NULL))
+		return 0;
+
+	const unsigned char *record = dc_buffer_get_data (resume) + offset;
+	size_t size = array_uint32_le (record + RESUME_SIZE);
+	if (array_uint32_le (record + RESUME_LISTED) != listed || size == 0 || size >= listed)
+		return 0;
+
+	dc_buffer_clear (buffer);
+	if (!dc_buffer_append (buffer, record + RESUME_HEADER, size)) {
+		dc_buffer_clear (buffer);
+		return 0;
+	}
+
+	return size;
+}
+
+// Fork only: keep the /Data received so far for a dive, in place of what was
+// kept for it before. The oldest record goes when there are too many.
+static void
+suunto_nautic_resume_keep (suunto_nautic_device_t *device, unsigned int id, unsigned int listed, dc_buffer_t *compressed)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_buffer_t *resume = device->resume;
+	size_t size = dc_buffer_get_size (compressed);
+	size_t offset = 0;
+	unsigned int count = 0;
+
+	if (suunto_nautic_resume_find (resume, id, &offset, &count)) {
+		suunto_nautic_resume_remove (resume, offset);
+		count--;
+	}
+	for (; count >= RESUME_MAX; count--)
+		suunto_nautic_resume_remove (resume, 0);
+
+	unsigned char header[RESUME_HEADER] = {0};
+	array_uint32_le_set (header + RESUME_ID, id);
+	array_uint32_le_set (header + RESUME_LISTED, listed);
+	array_uint32_le_set (header + RESUME_SIZE, size);
+
+	size_t end = dc_buffer_get_size (resume);
+	if (!dc_buffer_append (resume, header, sizeof (header)) ||
+		!dc_buffer_append (resume, dc_buffer_get_data (compressed), size)) {
+		dc_buffer_resize (resume, end);
+		return;
+	}
+
+	WARNING (abstract->context, "Keeping the " DC_PRINTF_SIZE " bytes of dive %u received so far for the next connection.", size, id);
+}
+
+// Fork only: after a dive's download, keep the /Data received so far when the
+// link failed, for the next connection, or forget what was kept for the dive
+// when it downloaded or its bytes can't be trusted. A resumed download that
+// timed out without getting any further starts over next time, instead of
+// trying the same way again. `resumed` is the number of bytes it started
+// with.
+static void
+suunto_nautic_resume_update (suunto_nautic_device_t *device, unsigned int id, unsigned int listed,
+	dc_buffer_t *compressed, size_t resumed, dc_status_t status)
+{
+	dc_buffer_t *resume = device->resume;
+
+	if (resume == NULL)
+		return;
+
+	size_t size = compressed ? dc_buffer_get_size (compressed) : 0;
+	int stalled = status == DC_STATUS_TIMEOUT && resumed && size <= resumed;
+	if (suunto_nautic_resumable (status) && !stalled) {
+		if (listed && size && size < listed)
+			suunto_nautic_resume_keep (device, id, listed, compressed);
+		return;
+	}
+
+	suunto_nautic_resume_forget (device, id);
+}
+
+// Fork only: finish a download from the /Data an earlier connection received.
+// The /Summary comes first: the listed size less the /Summary is the size of
+// the whole /Data, so the rest is read in pages only when some is missing,
+// and never from past its end. If the watch won't serve the rest in pages,
+// the /Data is streamed from the start, as without the kept bytes.
+static dc_status_t
+suunto_nautic_resume (suunto_nautic_device_t *device, unsigned int id, unsigned int listed,
+	dc_buffer_t *compressed, dc_buffer_t *summary)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	char data_path[64], summary_path[64];
+	snprintf (data_path, sizeof (data_path), "/Logbook/byId/%u/Data", id);
+	snprintf (summary_path, sizeof (summary_path), "/Logbook/byId/%u/Summary", id);
+
+	status = suunto_nautic_fetch_pages (device, summary_path, summary);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to fetch the summary of dive %u.", id);
+		return status;
+	}
+
+	size_t kept = dc_buffer_get_size (compressed);
+	size_t summary_size = dc_buffer_get_size (summary);
+	if (summary_size >= listed || kept > listed - summary_size) {
+		WARNING (abstract->context, "The " DC_PRINTF_SIZE " bytes kept for dive %u don't fit its listed size, downloading it again.", kept, id);
+		suunto_nautic_resume_forget (device, id);
+		dc_buffer_clear (compressed);
+		status = suunto_nautic_stream (device, data_path, compressed);
+	} else if (kept == listed - summary_size) {
+		WARNING (abstract->context, "Resuming dive %u with its whole profile (" DC_PRINTF_SIZE " bytes) from an earlier connection.", id, kept);
+	} else {
+		WARNING (abstract->context, "Resuming dive %u at offset " DC_PRINTF_SIZE " of " DC_PRINTF_SIZE " from an earlier connection, reading the rest in pages.",
+			id, kept, listed - summary_size);
+		status = suunto_nautic_resume_pages (device, data_path, compressed);
+		if (status == DC_STATUS_PROTOCOL) {
+			WARNING (abstract->context, "The watch didn't serve the rest of dive %u in pages, downloading it again.", id);
+			status = suunto_nautic_stream (device, data_path, compressed);
+		}
+	}
+
+	if (status != DC_STATUS_SUCCESS)
+		ERROR (abstract->context, "Failed to download the profile of dive %u.", id);
+
+	return status;
+}
+
 // Read a small resource that fits in a single reply (/Info).
 static dc_status_t
 suunto_nautic_fetch (suunto_nautic_device_t *device, const char *path, dc_buffer_t *buffer)
@@ -931,6 +1162,7 @@ suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigne
 {
 	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
+	size_t resumed = 0;
 
 	char data_path[64], summary_path[64];
 	snprintf (data_path, sizeof (data_path), "/Logbook/byId/%u/Data", id);
@@ -944,16 +1176,25 @@ suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigne
 		goto error_free;
 	}
 
-	status = suunto_nautic_stream (device, data_path, compressed);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to download the profile of dive %u.", id);
-		goto error_free;
-	}
+	// Fork only: carry on from the /Data an earlier connection received for
+	// this dive, when the caller kept it.
+	resumed = suunto_nautic_resume_load (device, id, listed, compressed);
+	if (resumed) {
+		status = suunto_nautic_resume (device, id, listed, compressed, summary);
+		if (status != DC_STATUS_SUCCESS)
+			goto error_free;
+	} else {
+		status = suunto_nautic_stream (device, data_path, compressed);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to download the profile of dive %u.", id);
+			goto error_free;
+		}
 
-	status = suunto_nautic_fetch_pages (device, summary_path, summary);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to fetch the summary of dive %u.", id);
-		goto error_free;
+		status = suunto_nautic_fetch_pages (device, summary_path, summary);
+		if (status != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to fetch the summary of dive %u.", id);
+			goto error_free;
+		}
 	}
 
 	size_t data_size = dc_buffer_get_size (compressed);
@@ -981,6 +1222,8 @@ suunto_nautic_download (suunto_nautic_device_t *device, unsigned int id, unsigne
 	}
 
 error_free:
+	// Fork only.
+	suunto_nautic_resume_update (device, id, listed, compressed, resumed, status);
 	if (status != DC_STATUS_SUCCESS)
 		dc_buffer_clear (buffer);
 	dc_buffer_free (summary);
@@ -1438,6 +1681,33 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 		return status;
 
 	return suunto_nautic_download (device, (unsigned int) id, listed, raw);
+}
+
+dc_status_t
+suunto_nautic_device_set_resume (dc_device_t *abstract, dc_buffer_t *resume)
+{
+	if (!suunto_nautic_is_device (abstract))
+		return DC_STATUS_INVALIDARGS;
+
+	((suunto_nautic_device_t *) abstract)->resume = resume;
+
+	return DC_STATUS_SUCCESS;
+}
+
+dc_status_t
+suunto_nautic_device_get_resume (dc_device_t *abstract, unsigned int id, unsigned int *size)
+{
+	if (!suunto_nautic_is_device (abstract) || size == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	dc_buffer_t *resume = ((suunto_nautic_device_t *) abstract)->resume;
+	size_t offset = 0;
+
+	*size = 0;
+	if (resume && suunto_nautic_resume_find (resume, id, &offset, NULL))
+		*size = array_uint32_le (dc_buffer_get_data (resume) + offset + RESUME_SIZE);
+
+	return DC_STATUS_SUCCESS;
 }
 
 // GET a path, returning the handle and the reply status even when the status

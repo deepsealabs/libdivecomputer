@@ -126,6 +126,34 @@ dc_status_t
 suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_buffer_t *raw);
 
 /*
+ * Carry a dive's download over a dropped link. `resume` is a buffer the
+ * caller keeps for one watch across connections and hands to each device it
+ * opens for that watch; NULL detaches it. The device doesn't own it, so it
+ * must outlive the device or be detached first.
+ *
+ * When a listed dive fails to download because the link went or the
+ * download was cancelled (DC_STATUS_TIMEOUT, _IO, _NODEVICE, _CANCELLED),
+ * the device keeps the compressed /Data received so far in `resume`. The
+ * next download of the same dive, by dc_device_foreach() or
+ * suunto_nautic_device_download(), on this device or a later one, fetches
+ * the /Summary first, which gives the size of the whole /Data, then GETs the
+ * /Data again and reads only what is missing, in pages from the first
+ * missing byte, instead of streaming it from the start. A success, or any
+ * failure other than the link's, forgets the dive, and so does a resumed
+ * download that times out without getting any further. It holds up to 4
+ * dives, the oldest going first, and its content is only valid for the watch
+ * it came from.
+ *
+ * get_resume reports the number of /Data bytes held for a dive, 0 when
+ * none. Neither call may run while a download does.
+ */
+dc_status_t
+suunto_nautic_device_set_resume (dc_device_t *device, dc_buffer_t *resume);
+
+dc_status_t
+suunto_nautic_device_get_resume (dc_device_t *device, unsigned int id, unsigned int *size);
+
+/*
  * Value subscriptions (e.g. "/Logbook/UnsynchronisedLogs", "/Sync/BusyState").
  * subscribe writes the resource handle and the current value; the value is
  * Whiteboard-encoded as [type:u16 LE][value...]. wait_notification returns the
