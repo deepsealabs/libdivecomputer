@@ -67,12 +67,17 @@
  *     newest first, stopping at the first id matching the fingerprint.
  *
  * Datetime:
- *   - The stream carries no wall-clock timestamp except in GPS fixes
- *     (chunk 0x0B), which hold an absolute UTC in milliseconds, so
- *     dc_parser_get_datetime() derives start = gps_utc - gps_rel_time.
- *     A dive with no surface GPS fix has no absolute clock in the
- *     stream; datetime is unsupported for it. The LogId (the dive id) is
- *     itself that timestamp and can serve as a fallback.
+ *   - The stream opens with the timeline base (chunk 0x01), the format
+ *     the descriptors call local64: the wall clock in milliseconds, then
+ *     the offset from UTC in quarter hours. dc_parser_get_datetime()
+ *     reports that wall clock, with datetime->timezone set to the offset.
+ *   - GPS fixes (chunk 0x0B) hold the same clock as an absolute UTC in
+ *     milliseconds, so start = gps_utc - gps_rel_time checks the base.
+ *     Where the base is missing, implausible or contradicted, that start
+ *     is reported in UTC, with datetime->timezone 0.
+ *   - A dive with neither has no absolute clock in the stream; datetime
+ *     is unsupported for it. The LogId (the dive id) is itself that
+ *     timestamp and can serve as a fallback.
  *
  * Resynchronisation:
  *   - Heatshrink decompression can leave localized artifacts (runs of a
