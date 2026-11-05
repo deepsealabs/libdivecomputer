@@ -32,6 +32,12 @@
  *     it over the same link, so replies to another app's requests are
  *     recognized by their sequence number and skipped, as are leftover
  *     notifications of a stream that has ended.
+ *   - A client starts a session with a hello (0x12), which takes over any
+ *     other session on the link. The watch answers a request from a client
+ *     that didn't say hello only when another app has a session, so a GET
+ *     before the hello tells whether one does; if so, the driver uses it
+ *     instead of saying hello. A Suunto app whose session is taken over,
+ *     and that doesn't answer with a hello of its own, stops getting replies.
  *   - A GET (0x0A) resolves a path to a handle; the other requests (FETCH
  *     0x0D, SUBSCRIBE 0x10, UNSUBSCRIBE 0x11, RELEASE 0x0B) address that
  *     handle. A per-dive handle stays bound until it is released.

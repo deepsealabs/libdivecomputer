@@ -127,6 +127,24 @@
 #define TIMEOUT_DEFAULT 5000
 #define TIMEOUT_STREAM  4000 // the gap between two chunks reaches about 2s
 
+// Another app (the Suunto app) may already have a session on the link. Before
+// a hello of our own, a GET without one: the watch answers it only when there
+// is a session, and then we use that session. A hello would take it over, and
+// a Suunto app that doesn't answer it with a hello of its own keeps sending
+// requests but stops getting their replies. A fresh link stays silent.
+#define PROBE_PATH    "/Logbook/Entries"
+#define TIMEOUT_PROBE 1500
+// The watch doesn't answer the probe while another app's stream is running.
+// Then wait until the link has been quiet for QUIET_MS, longer than the
+// Suunto app's ~10.6 s hello retry, and ask again, up to PROBE_ROUNDS times;
+// each wait gives up after QUIET_MAX_S, so that the open fails with
+// DC_STATUS_TIMEOUT before a host gives up on a connection that takes too
+// long, and the host's next attempt waits on.
+#define PROBE_ROUNDS  3
+#define QUIET_POLL_MS 1000
+#define QUIET_MS      15000
+#define QUIET_MAX_S   20
+
 // Heatshrink (LZSS) parameters used by the Nautic/Ocean's MDS stream.
 #define HEATSHRINK_WINDOW_SZ2    7
 #define HEATSHRINK_LOOKAHEAD_SZ2 5
@@ -344,6 +362,93 @@ suunto_nautic_transfer (suunto_nautic_device_t *device, unsigned char opcode, un
 	return status;
 }
 
+// Whether another app already has a session on the link: the watch answers a
+// GET from a client that didn't say hello only then. The first packet decides:
+// the reply means a session, silence means none, and anything else means
+// another app is busy with the watch, and is all `busy` reports, since the
+// other app's stream could go on for minutes.
+static dc_status_t
+suunto_nautic_probe (suunto_nautic_device_t *device, int *shared, int *busy)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	size_t pathlen = strlen (PROBE_PATH);
+
+	unsigned char request[4 + MAX_PATH] = {0};
+	request[0] = 0x01;
+	request[1] = 0x80;
+	request[2] = 0x00;
+	request[3] = pathlen;
+	memcpy (request + 4, PROBE_PATH, pathlen);
+
+	*shared = 0;
+	*busy = 0;
+
+	unsigned int seqnum = suunto_nautic_seqnum (device);
+	status = suunto_nautic_send (device, RPC_OP_GET, seqnum, request, 4 + pathlen);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	unsigned char packet[RPC_OVERHEAD + MAX_PAYLOAD] = {0};
+	size_t length = 0;
+	status = dc_iostream_read (device->iostream, packet, sizeof (packet), &length);
+	if (status == DC_STATUS_TIMEOUT)
+		return DC_STATUS_SUCCESS;
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	if (length >= RPC_OVERHEAD && packet[0] == RPC_START && packet[1] == RPC_OP_GET_REPLY &&
+		array_uint16_le (packet + 4) == seqnum &&
+		array_uint32_le (packet + length - 4) == checksum_crc32r (packet, length - 4))
+		*shared = 1;
+	else
+		*busy = 1;
+
+	return status;
+}
+
+// Read and discard packets until the link has been quiet for QUIET_MS: the
+// traffic of another app using the watch.
+static dc_status_t
+suunto_nautic_wait_quiet (suunto_nautic_device_t *device)
+{
+	dc_device_t *abstract = (dc_device_t *) device;
+	dc_status_t status = DC_STATUS_SUCCESS;
+
+	status = dc_iostream_set_timeout (device->iostream, QUIET_POLL_MS);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	dc_ticks_t start = dc_datetime_now ();
+	unsigned int quiet = 0, packets = 0;
+	while (quiet < QUIET_MS) {
+		if (device_is_cancelled (abstract))
+			return DC_STATUS_CANCELLED;
+
+		if (dc_datetime_now () - start >= QUIET_MAX_S) {
+			ERROR (abstract->context, "The link is still busy after %u s.", QUIET_MAX_S);
+			return DC_STATUS_TIMEOUT;
+		}
+
+		unsigned char packet[RPC_OVERHEAD + MAX_PAYLOAD] = {0};
+		size_t length = 0;
+		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &length);
+		if (status == DC_STATUS_TIMEOUT) {
+			quiet += QUIET_POLL_MS;
+			continue;
+		}
+		if (status != DC_STATUS_SUCCESS)
+			return status;
+
+		if (length) {
+			packets++;
+			quiet = 0;
+		}
+	}
+
+	INFO (abstract->context, "The link is quiet (%u packets from the other app).", packets);
+	return DC_STATUS_SUCCESS;
+}
+
 dc_status_t
 suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream_t *iostream)
 {
@@ -375,7 +480,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		goto error_free;
 	}
 
-	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_PROBE);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to set the timeout.");
 		goto error_close;
@@ -383,6 +488,39 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 
 	dc_iostream_purge (device->iostream, DC_DIRECTION_ALL);
 
+	int shared = 0, busy = 0;
+	status = suunto_nautic_probe (device, &shared, &busy);
+	for (unsigned int round = 0; status == DC_STATUS_SUCCESS && busy && round < PROBE_ROUNDS; round++) {
+		INFO (context, "Another app is using the watch; waiting until it is done.");
+		status = suunto_nautic_wait_quiet (device);
+		if (status == DC_STATUS_SUCCESS)
+			status = dc_iostream_set_timeout (device->iostream, TIMEOUT_PROBE);
+		if (status == DC_STATUS_SUCCESS)
+			status = suunto_nautic_probe (device, &shared, &busy);
+	}
+	if (status == DC_STATUS_SUCCESS && busy) {
+		ERROR (context, "Another app is still using the watch.");
+		status = DC_STATUS_TIMEOUT;
+	}
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (context, "Failed to check for another app's session.");
+		goto error_close;
+	}
+
+	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (context, "Failed to set the timeout.");
+		goto error_close;
+	}
+
+	if (shared) {
+		INFO (context, "Another app has a session on the link; using it instead of a hello of our own.");
+		device->acknowledged = 1;
+		*out = (dc_device_t *) device;
+		return DC_STATUS_SUCCESS;
+	}
+
+	INFO (context, "No other session on the link (the request above went unanswered, as expected); saying hello.");
 	status = suunto_nautic_send (device, RPC_OP_HELLO, 0, suunto_nautic_hello, sizeof (suunto_nautic_hello));
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to send the hello.");
