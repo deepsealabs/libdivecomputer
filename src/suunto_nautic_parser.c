@@ -41,11 +41,14 @@
  * decoder is additive.
  *
  * Sample time is delta-encoded: every chunk except the timeline base
- * (0x01) begins with a signed int16 LE millisecond delta. The dive start
- * time (dc_parser_get_datetime()) is reconstructed from the only absolute
- * clock in the stream: each GPS fix (chunk 0x0B) carries an absolute UTC
- * in milliseconds, so start = gps_utc - gps_relative_time. A dive with no
- * surface GPS fix has no absolute clock, so datetime is unsupported for it.
+ * (0x01) begins with a signed int16 LE millisecond delta. The timeline
+ * base opens the stream with the wall clock at the start of the dive and
+ * the offset from UTC it was logged under, and dc_parser_get_datetime()
+ * reports those. Each GPS fix (chunk 0x0B) holds the same clock as an
+ * absolute UTC in milliseconds, so start = gps_utc - gps_relative_time
+ * checks the base, and gives the start in UTC where the base is missing,
+ * implausible or contradicted. A dive with neither has no absolute clock,
+ * so datetime is unsupported for it.
  */
 
 #include <string.h>
@@ -60,7 +63,17 @@
 
 #define SBEM_MAGIC_SIZE 8
 
+// The stream's first record, in the format the descriptors call local64:
+// [clock:7 LE][offset:int8], the wall clock in ms and the offset from UTC in
+// quarter hours. Every capture so far is east of UTC, so the sign of a negative
+// offset is unconfirmed; a GPS fix that disagrees overrules the record.
 #define CHUNK_TIMELINE_BASE   0x01
+#define TIMELINE_BASE_SIZE    8
+#define TIMELINE_CLOCK_MIN    946684800000ULL  // 2000-01-01, ms
+#define TIMELINE_CLOCK_MAX    4102444800000ULL // 2100-01-01, ms
+#define TIMELINE_OFFSET_MIN   -48 // UTC-12:00
+#define TIMELINE_OFFSET_MAX   56  // UTC+14:00
+#define TIMELINE_GPS_SLACK    60  // seconds; a misread offset is off by 30 min or more
 #define CHUNK_ACTIVITY        0x08 // [timeDelta:2][sportId:1][customModeId: ascii]
 // Suunto sport ids seen on the Nautic/Ocean, from the app's ActivityType:
 // 51 = scuba, 61 = free diving, 62 = mermaiding. Only the last two are apnea.
@@ -193,6 +206,7 @@ typedef struct suunto_nautic_parser_t {
 	unsigned int have_atmospheric;
 	double atmospheric; // bar
 	unsigned int have_datetime;
+	int timezone; // the dive's offset from UTC, seconds; 0 when only UTC is known
 	dc_ticks_t datetime; // dive start, UNIX seconds
 	dc_divemode_t divemode; // from the CHUNK_ACTIVITY sport id; OC unless apnea
 	// From the /Summary SBEM section appended after the profile, if present.
@@ -329,6 +343,31 @@ suunto_nautic_find_summary (const unsigned char *data, size_t size)
 			return i;
 	}
 	return size;
+}
+
+// The dive start in UNIX seconds and its offset from UTC in seconds, from the
+// timeline base. Read by position, as a stray 01 08 further on is not the base.
+// Returns 0 when the stream doesn't open with a plausible one.
+static int
+suunto_nautic_timeline_base (const unsigned char *data, size_t size, dc_ticks_t *start, int *timezone)
+{
+	const unsigned char *base = data + SBEM_MAGIC_SIZE;
+
+	if (size < SBEM_MAGIC_SIZE + 2 + TIMELINE_BASE_SIZE ||
+		base[0] != CHUNK_TIMELINE_BASE || base[1] != TIMELINE_BASE_SIZE)
+		return 0;
+
+	unsigned long long clock_ms = array_uint64_le (base + 2) & 0x00FFFFFFFFFFFFFFULL;
+	int offset = (signed char) base[2 + 7];
+
+	if (clock_ms < TIMELINE_CLOCK_MIN || clock_ms >= TIMELINE_CLOCK_MAX ||
+		offset < TIMELINE_OFFSET_MIN || offset > TIMELINE_OFFSET_MAX)
+		return 0;
+
+	*timezone = offset * 900;
+	*start = (dc_ticks_t) (clock_ms / 1000) - *timezone;
+
+	return 1;
 }
 
 // The /Summary's records are plain [id][len] TLVs (the profile's fixed-length
@@ -784,9 +823,9 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 			// Payload: [timeDelta:2][UTC:8 ms LE][lat:4][lon:4]. UTC is an
 			// absolute UNIX time in milliseconds; subtracting this sample's
 			// relative time (time_ms) yields the stream-start epoch, i.e. the
-			// dive start (== the logbook id, confirmed to the second). This is
-			// the only absolute clock in the stream, so the first GPS fix sets
-			// the dive datetime.
+			// dive start (== the logbook id, confirmed to the second). The
+			// first GPS fix sets the dive datetime, and the timeline base
+			// replaces it after the walk if the two agree.
 			unsigned long long utc_ms = array_uint64_le (chunk.data + 2);
 			int lat_raw = (int) array_uint32_le (chunk.data + 10);
 			int lon_raw = (int) array_uint32_le (chunk.data + 14);
@@ -989,6 +1028,18 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->location = location;
 	parser->have_atmospheric = have_atmospheric;
 	parser->atmospheric = atmospheric;
+	parser->timezone = 0;
+	dc_ticks_t base_start = 0;
+	int base_timezone = 0;
+	if (suunto_nautic_timeline_base (abstract->data, profile_size, &base_start, &base_timezone)) {
+		if (have_datetime && llabs (base_start - parser->datetime) > TIMELINE_GPS_SLACK) {
+			WARNING (abstract->context, "The timeline base disagrees with the GPS clock.");
+		} else {
+			have_datetime = 1;
+			parser->datetime = base_start;
+			parser->timezone = base_timezone;
+		}
+	}
 	parser->have_datetime = have_datetime;
 	parser->divemode = divemode;
 
@@ -1071,14 +1122,20 @@ suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetim
 			return status;
 	}
 
-	// The dive start is derived from the first GPS fix's absolute UTC. A dive
-	// without a surface GPS fix has no absolute clock in the stream; the caller
-	// falls back to the logbook id (which is that same timestamp).
+	// A dive with neither a timeline base nor a surface GPS fix has no absolute
+	// clock in the stream; the caller falls back to the logbook id (which is
+	// that same timestamp).
 	if (!parser->have_datetime)
 		return DC_STATUS_UNSUPPORTED;
 
-	if (datetime && !dc_datetime_gmtime (datetime, parser->datetime))
-		return DC_STATUS_DATAFORMAT;
+	if (datetime) {
+		// The fields hold the wall clock the dive was logged under, or UTC
+		// where that offset isn't known.
+		if (!dc_datetime_gmtime (datetime, parser->datetime + parser->timezone))
+			return DC_STATUS_DATAFORMAT;
+
+		datetime->timezone = parser->timezone;
+	}
 
 	return DC_STATUS_SUCCESS;
 }
