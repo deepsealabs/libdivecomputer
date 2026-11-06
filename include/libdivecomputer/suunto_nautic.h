@@ -131,8 +131,10 @@ suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_b
  * opens for that watch; NULL detaches it. The device doesn't own it, so it
  * must outlive the device or be detached first.
  *
- * When a listed dive fails to download because the link went or the
- * download was cancelled (DC_STATUS_TIMEOUT, _IO, _NODEVICE, _CANCELLED),
+ * When a listed dive fails to download because the link went, another app
+ * was using the watch (DC_STATUS_IO, after waiting for it to finish; try
+ * again once it is done),
+ * or the download was cancelled (DC_STATUS_TIMEOUT, _IO, _NODEVICE, _CANCELLED),
  * the device keeps the compressed /Data received so far in `resume`. The
  * next download of the same dive, by dc_device_foreach() or
  * suunto_nautic_device_download(), on this device or a later one, fetches

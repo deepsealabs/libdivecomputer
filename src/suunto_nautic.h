@@ -29,9 +29,33 @@
  *     payload(length), crc32(u32 LE), where crc32 is the reflected CRC-32
  *     (checksum_crc32r) of every preceding byte. A reply echoes the
  *     request's sequence number. The watch serves every app connected to
- *     it over the same link, so replies to another app's requests are
- *     recognized by their sequence number and skipped, as are leftover
- *     notifications of a stream that has ended.
+ *     it over the same link: a reply to another app's request is
+ *     recognized by its sequence number (see below), and leftover
+ *     notifications of a stream that has ended are skipped.
+ *   - A client starts a session with a hello (0x12), which takes over any
+ *     other session on the link. The watch answers a request from a client
+ *     that didn't say hello only when another app has a session, so a GET
+ *     before the hello tells whether one does; if so, the driver uses it
+ *     instead of saying hello. A Suunto app whose session is taken over,
+ *     and that doesn't answer with a hello of its own, stops getting replies.
+ *   - The watch has one /Data stream, shared by every client. While it
+ *     runs, the watch drops other clients' GETs (a PUT can still be
+ *     answered), so a client that streams starves the others: the Suunto
+ *     app, its requests unanswered, says hello again, which ends the stream.
+ *     So the driver steps aside as soon as another app shows it is using the
+ *     watch: a reply to another app's request, a hello reply, or a 404 to the
+ *     UNSUBSCRIBE that closes our stream (a hello that cut off the chunk it
+ *     arrived in ends our session that way). It ends a stream that is still
+ *     its own (not one the other app's request or hello took), waits until
+ *     the link has been quiet for a while (bounded), and fails the download
+ *     with DC_STATUS_IO, keeping what arrived before for a resume. The device
+ *     then sends nothing more; a new device waits for the link to go quiet on
+ *     open.
+ *   - A stream nobody unsubscribed (its app was killed, or the link went
+ *     mid-stream) runs to its end and then holds the stream: every SUBSCRIBE
+ *     gets 423 until a hello. An UNSUBSCRIBE only clears it from slot 0, so
+ *     with the link quiet, the driver frees the slots, binds again in slot 0,
+ *     ends it with an UNSUBSCRIBE there and subscribes again.
  *   - A GET (0x0A) resolves a path to a handle; the other requests (FETCH
  *     0x0D, SUBSCRIBE 0x10, UNSUBSCRIBE 0x11, RELEASE 0x0B) address that
  *     handle. A per-dive handle stays bound until it is released.
