@@ -60,6 +60,9 @@
 // HTTP-like status codes carried in the replies.
 #define ERR_OK       200
 #define ERR_CONTINUE 100 // more pages follow
+// Fork only.
+#define ERR_NOT_FOUND 404
+#define ERR_LOCKED    423
 
 // A GET of a per-id path (/Logbook/byId/<id>/...) binds the id to one of the
 // resource's handle slots, [00|10] 24 <resource>, until a RELEASE frees it. A
@@ -73,6 +76,7 @@
 #define HANDLE_ISSTATIC(handle)  (((handle) & 0xFF) == 0xF0)
 #define HANDLE_ISINVALID(handle) ((handle) == 0xFFFFFF)
 #define HANDLE_RESOURCE(handle)  ((handle) >> 8)
+#define HANDLE_SLOT(handle)      ((handle) & 0xFF)
 
 // Request parameters are COUNT(1), then TYPE(2) VALUE for each parameter. The
 // /Summary page offset is an int32, the /Logbook/Entries StartAfterId (the id
@@ -157,6 +161,10 @@
 #define QUIET_MS      15000
 #define QUIET_MAX_S   20
 
+// Fork only: why the device stepped aside for another app (taken_over).
+#define TAKEN_ACTIVE 1 // the other app is using the watch; our stream is still ours
+#define TAKEN_STREAM 2 // its hello ended our stream, or its request took it
+
 // Heatshrink (LZSS) parameters used by the Nautic/Ocean's MDS stream.
 #define HEATSHRINK_WINDOW_SZ2    7
 #define HEATSHRINK_LOOKAHEAD_SZ2 5
@@ -201,9 +209,15 @@ typedef struct suunto_nautic_device_t {
 	// Fork only: set while the extension API waits for a notification, where
 	// a timeout without a byte received is the usual outcome, not an error.
 	int polling;
+	// Fork only: whether another app took the link over (TAKEN_*), after
+	// which every request fails until the device is reopened, and whether the
+	// device has waited for the other app since.
+	int taken_over;
+	int stepped_aside;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
+static void suunto_nautic_step_aside (suunto_nautic_device_t *device);
 static dc_status_t suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata);
 static dc_status_t suunto_nautic_device_close (dc_device_t *abstract);
 
@@ -265,6 +279,14 @@ suunto_nautic_send (suunto_nautic_device_t *device, unsigned char opcode, unsign
 	dc_device_t *abstract = (dc_device_t *) device;
 	unsigned char packet[6 + MAX_PAYLOAD + 4] = {0};
 
+	// Fork only: after a takeover the other app is using the watch: our
+	// requests would get in its way, or, while its stream runs, go unanswered
+	// until it ends.
+	if (device->taken_over) {
+		ERROR (abstract->context, "Another app has the link; not sending.");
+		return DC_STATUS_IO;
+	}
+
 	// The UNSUBSCRIBE and RELEASE still go out after a cancel, so the watch
 	// doesn't keep streaming or keep the handle bound.
 	if (opcode != RPC_OP_UNSUBSCRIBE && opcode != RPC_OP_RELEASE &&
@@ -318,11 +340,22 @@ suunto_nautic_skip (suunto_nautic_device_t *device, unsigned char opcode, dc_use
 	return status;
 }
 
+// Fork only: another app's hello cuts off the chunk it arrives in. While a
+// stream of ours is on, a damaged packet is a lost chunk: the next packet
+// tells whether the stream goes on with a gap, was taken over or stopped.
+static dc_status_t
+suunto_nautic_skip_damaged (suunto_nautic_device_t *device, unsigned char opcode, dc_usecs_t begin, size_t length)
+{
+	WARNING (device->base.context, "Skipping a damaged packet (" DC_PRINTF_SIZE " bytes).", length);
+	return suunto_nautic_skip (device, opcode, begin);
+}
+
 // Receive the packet with the given opcode and sequence number. The watch
-// serves every app connected to it over the same link, so the replies to
-// another app's requests can arrive in between. Those are recognized by their
-// sequence number and skipped, and so are the notifications that are still
-// on their way after a stream was stopped before its end.
+// serves every app connected to it over the same link, so other packets can
+// arrive in between. The notifications that are still on their way after a
+// stream was stopped before its end are skipped; a reply to another app's
+// request, which is recognized by its sequence number, fails with
+// DC_STATUS_IO (fork only, see below).
 static dc_status_t
 suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsigned int seqnum, unsigned char data[], size_t size, size_t *actual)
 {
@@ -347,6 +380,12 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		}
 
 		if (length < 10) {
+			if (device->stream) {
+				status = suunto_nautic_skip_damaged (device, opcode, begin, length);
+				if (status != DC_STATUS_SUCCESS)
+					return status;
+				continue;
+			}
 			ERROR (device->base.context, "Unexpected packet size (" DC_PRINTF_SIZE ").", length);
 			return DC_STATUS_PROTOCOL;
 		}
@@ -354,6 +393,12 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		unsigned int crc = array_uint32_le (packet + length - 4);
 		unsigned int ccrc = checksum_crc32r (packet, length - 4);
 		if (crc != ccrc) {
+			if (device->stream) {
+				status = suunto_nautic_skip_damaged (device, opcode, begin, length);
+				if (status != DC_STATUS_SUCCESS)
+					return status;
+				continue;
+			}
 			ERROR (device->base.context, "Unexpected packet checksum (%08x %08x).", crc, ccrc);
 			return DC_STATUS_PROTOCOL;
 		}
@@ -370,6 +415,30 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		}
 
 		unsigned int rsp_opcode = packet[1];
+		unsigned int rsp_seqnum = array_uint16_le (packet + 4);
+
+		// Fork only: a reply to another app's request, or its hello, means
+		// that app is using the watch. The watch drops the GETs that arrive
+		// while a /Data stream runs, so carrying on would starve the other
+		// app, which then says hello again and ends our stream, and its hello
+		// ends the handles we hold. Step aside: what arrived before is still
+		// ours, and a new device waits for the link to go quiet on open.
+		if (rsp_opcode != RPC_OP_NOTIFICATION && (rsp_opcode != opcode || rsp_seqnum != seqnum)) {
+			WARNING (device->base.context, "Another app is using the watch (%02x %u).", rsp_opcode, rsp_seqnum);
+			// The watch has one /Data stream, shared by every client: a reply
+			// on its resource (whatever the slot) means the other app's
+			// request took it or ended it.
+			if (rsp_opcode == RPC_OP_HELLO_REPLY || (device->stream && rsp_length >= 3 &&
+				HANDLE_RESOURCE (array_uint24_le (packet + 6)) == HANDLE_RESOURCE (device->stream)))
+				device->taken_over = TAKEN_STREAM;
+			else if (!device->taken_over)
+				device->taken_over = TAKEN_ACTIVE;
+			// A stream of ours is stopped first (suunto_nautic_stream).
+			if (!device->stream)
+				suunto_nautic_step_aside (device);
+			return DC_STATUS_IO;
+		}
+
 		if (rsp_opcode != opcode) {
 			WARNING (device->base.context, "Skipping a packet with an unexpected opcode (%02x %02x).", rsp_opcode, opcode);
 			// The rest of a stopped stream of ours shows the watch is still busy with us.
@@ -383,7 +452,6 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 			continue;
 		}
 
-		unsigned int rsp_seqnum = array_uint16_le (packet + 4);
 		if (rsp_seqnum != seqnum) {
 			WARNING (device->base.context, "Skipping a packet with an unexpected sequence number (%u %u).", rsp_seqnum, seqnum);
 			status = suunto_nautic_skip (device, opcode, begin);
@@ -791,6 +859,7 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 	unsigned int missing = 0;
 	unsigned int end = 0;
 	dc_usecs_t last = 0; // the last notification for the stream
+	int taken_over = 0;
 
 	unsigned int handle = 0;
 	status = suunto_nautic_get_handle (device, path, &handle);
@@ -802,8 +871,42 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 	// The SUBSCRIBE and UNSUBSCRIBE replies carry two more bytes, 00 00.
 	unsigned char reply[2] = {0};
 	unsigned int errcode = 0;
-	status = suunto_nautic_transfer (device, RPC_OP_SUBSCRIBE, RPC_OP_SUBSCRIBE_REPLY,
-		handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), NULL, &errcode);
+	for (unsigned int attempt = 0; ; attempt++) {
+		status = suunto_nautic_transfer (device, RPC_OP_SUBSCRIBE, RPC_OP_SUBSCRIBE_REPLY,
+			handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), NULL, &errcode);
+
+		// Fork only: a stream that was never unsubscribed, because the app
+		// that asked for it was killed or lost the link, holds the watch's
+		// one stream after it ends: every SUBSCRIBE gets 423 until a hello.
+		// The link is quiet (the open waited for that), so it isn't another
+		// app's stream running; it was asked for in the session we share, and
+		// ours can end it, but only with an UNSUBSCRIBE from slot 0. So when
+		// its old binding put us in another slot, free both and bind again.
+		if (status != DC_STATUS_PROTOCOL || errcode != ERR_LOCKED || attempt >= 2)
+			break;
+
+		if (HANDLE_SLOT (handle) != 0) {
+			WARNING (abstract->context, "A stream left over from an earlier connection holds the watch (error code %u); freeing its slot.", errcode);
+			status = suunto_nautic_release (device, handle & ~0xFFu);
+			if (status == DC_STATUS_SUCCESS)
+				status = suunto_nautic_release (device, handle);
+			if (status == DC_STATUS_SUCCESS)
+				status = suunto_nautic_get_handle (device, path, &handle);
+			if (status != DC_STATUS_SUCCESS)
+				goto error_exit;
+			device->stream = handle;
+			continue;
+		}
+
+		WARNING (abstract->context, "A stream left over from an earlier connection holds the watch (error code %u); ending it.", errcode);
+		status = suunto_nautic_transfer (device, RPC_OP_UNSUBSCRIBE, RPC_OP_UNSUBSCRIBE_REPLY,
+			handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), NULL, &errcode);
+		if (status != DC_STATUS_SUCCESS && !(status == DC_STATUS_PROTOCOL && errcode)) {
+			ERROR (abstract->context, "Failed to unsubscribe from %s.", path);
+			goto error_release;
+		}
+		INFO (abstract->context, "Unsubscribed the left-over stream (error code %u).", errcode);
+	}
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to subscribe to %s.", path);
 		// Without its reply, the watch may have subscribed all the same.
@@ -928,12 +1031,27 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 
 error_unsubscribe:
 	// Without the UNSUBSCRIBE the watch keeps streaming, and the next GET of a
-	// stream is refused with status 423.
-	rc = suunto_nautic_transfer (device, RPC_OP_UNSUBSCRIBE, RPC_OP_UNSUBSCRIBE_REPLY,
-		handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), NULL, NULL);
-	if (rc != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to unsubscribe from %s.", path);
-		dc_status_set_error (&status, rc);
+	// stream is refused with status 423. Fork only: a stream left running also
+	// starves the other app we step aside for. Once the stream is the other
+	// app's, ours would end it; the handle is left bound, as after a lost link.
+	taken_over = device->taken_over;
+	if (taken_over != TAKEN_STREAM) {
+		device->taken_over = 0;
+		rc = suunto_nautic_transfer (device, RPC_OP_UNSUBSCRIBE, RPC_OP_UNSUBSCRIBE_REPLY,
+			handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), NULL, &errcode);
+		if (rc == DC_STATUS_PROTOCOL && errcode == ERR_NOT_FOUND) {
+			// Another app's hello ended our session, and the stream with it.
+			// The hello usually cuts off the chunk it arrives in, and its
+			// reply then never arrives whole.
+			WARNING (abstract->context, "Another app ended the stream (error code %u).", errcode);
+			device->taken_over = TAKEN_STREAM;
+			dc_status_set_error (&status, DC_STATUS_IO);
+		} else if (rc != DC_STATUS_SUCCESS) {
+			ERROR (abstract->context, "Failed to unsubscribe from %s.", path);
+			dc_status_set_error (&status, rc);
+		}
+		if (device->taken_over < taken_over)
+			device->taken_over = taken_over;
 	}
 
 	rc = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
@@ -948,10 +1066,19 @@ error_unsubscribe:
 		status = suunto_nautic_read_pages (device, path, handle, received, progress, buffer);
 
 error_release:
-	rc = suunto_nautic_release (device, handle);
-	if (rc != DC_STATUS_SUCCESS)
-		dc_status_set_error (&status, rc);
+	// Fork only: after a takeover the device sends nothing more.
+	if (!device->taken_over) {
+		rc = suunto_nautic_release (device, handle);
+		if (rc != DC_STATUS_SUCCESS)
+			dc_status_set_error (&status, rc);
+	}
+error_exit:
 	device->stream = 0;
+	// Fork only: with the stream of ours stopped, step aside.
+	if (device->taken_over) {
+		suunto_nautic_step_aside (device);
+		dc_status_set_error (&status, DC_STATUS_IO);
+	}
 	return status;
 }
 
@@ -1605,6 +1732,22 @@ suunto_nautic_wait_quiet (suunto_nautic_device_t *device)
 	return DC_STATUS_SUCCESS;
 }
 
+// Fork only: after a takeover, keep off the link until the other app is done
+// with it, before failing: a host that reconnects at once would otherwise
+// meet the other app between its hello and its first requests, find the link
+// quiet and get in its way again. The wait is bounded and cancellable.
+static void
+suunto_nautic_step_aside (suunto_nautic_device_t *device)
+{
+	if (device->stepped_aside)
+		return;
+	device->stepped_aside = 1;
+
+	WARNING (device->base.context, "Waiting for the other app to finish.");
+	suunto_nautic_wait_quiet (device);
+	dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+}
+
 dc_status_t
 suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream_t *iostream)
 {
@@ -1633,6 +1776,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	device->resume = NULL;
 	device->nondives = 0;
 	device->polling = 0;
+	device->taken_over = 0;
+	device->stepped_aside = 0;
 
 	status = dc_timer_new (&device->timer);
 	if (status != DC_STATUS_SUCCESS) {
