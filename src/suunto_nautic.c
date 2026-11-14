@@ -137,15 +137,24 @@
 #define PROBE_PATH    "/Logbook/Entries"
 #define TIMEOUT_PROBE 1500
 // The watch doesn't answer the probe while another app's stream is running.
-// Then wait until the link has been quiet for QUIET_MS, longer than the
-// Suunto app's ~10.6 s hello retry, and ask again, up to PROBE_ROUNDS times;
-// each wait gives up after QUIET_MAX_S, so that the open fails with
-// DC_STATUS_TIMEOUT before a host gives up on a connection that takes too
-// long, and the host's next attempt waits on.
-#define PROBE_ROUNDS  3
+// Then wait once until the link has been quiet for QUIET_MS, longer than the
+// Suunto app's ~10.6 s hello retry, and ask again. The wait gives up after
+// QUIET_MAX_S, so that the open fails with DC_STATUS_TIMEOUT before a host
+// gives up on a connection that takes too long. A link that is still busy
+// fails the open, and the retry is left to the application.
 #define QUIET_POLL_MS 1000
 #define QUIET_MS      15000
 #define QUIET_MAX_S   20
+// On a shared session the watch's replies to the other app reach us too, and
+// those that arrive while we're idle wait in the receive buffer. A download
+// first reads and drops them, a packet at a time with a short timeout, so
+// that only a reply that arrives while we're working counts as the other app
+// using the watch. Waiting packets come back at once and the drain ends at
+// the first read that times out, so an app that is busy right now doesn't
+// keep it going: the first request then sees its traffic. DRAIN_MAX only
+// bounds the backlog, which a long app sync (hundreds of replies) can fill.
+#define DRAIN_MS  10
+#define DRAIN_MAX 1024
 
 // Why the device stepped aside for another app (taken_over).
 #define TAKEN_ACTIVE 1 // the other app is using the watch; our stream is still ours
@@ -516,6 +525,35 @@ suunto_nautic_step_aside (suunto_nautic_device_t *device)
 	suunto_nautic_wait_quiet (device);
 }
 
+// Drop the packets left in the receive buffer since the last request: on a
+// shared session, the watch's replies to the other app. Not
+// dc_iostream_purge, which not every transport implements.
+static dc_status_t
+suunto_nautic_drain (suunto_nautic_device_t *device)
+{
+	dc_status_t status = dc_iostream_set_timeout (device->iostream, DRAIN_MS);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	unsigned int packets = 0;
+	while (packets < DRAIN_MAX) {
+		unsigned char packet[RPC_OVERHEAD + MAX_PAYLOAD] = {0};
+		size_t length = 0;
+		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &length);
+		if (status == DC_STATUS_TIMEOUT)
+			break;
+		if (status != DC_STATUS_SUCCESS)
+			return status;
+		if (length)
+			packets++;
+	}
+
+	if (packets)
+		INFO (device->base.context, "Dropped %u packets left from before the download.", packets);
+
+	return dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+}
+
 dc_status_t
 suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream_t *iostream)
 {
@@ -560,7 +598,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 
 	int shared = 0, busy = 0;
 	status = suunto_nautic_probe (device, &shared, &busy);
-	for (unsigned int round = 0; status == DC_STATUS_SUCCESS && busy && round < PROBE_ROUNDS; round++) {
+	if (status == DC_STATUS_SUCCESS && busy) {
 		INFO (context, "Another app is using the watch; waiting until it is done.");
 		status = suunto_nautic_wait_quiet (device);
 		if (status == DC_STATUS_SUCCESS)
@@ -1610,6 +1648,12 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	dc_event_progress_t progress = EVENT_PROGRESS_INITIALIZER;
 	progress.maximum = 2;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+
+	status = suunto_nautic_drain (device);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (abstract->context, "Failed to drop the packets left from before.");
+		return status;
+	}
 
 	status = suunto_nautic_devinfo (device);
 	if (status != DC_STATUS_SUCCESS)
