@@ -1027,10 +1027,10 @@ suunto_nautic_resume_keep (suunto_nautic_device_t *device, unsigned int id, unsi
 
 // Fork only: after a dive's download, keep the /Data received so far when the
 // link failed, for the next connection, or forget what was kept for the dive
-// when it downloaded or its bytes can't be trusted. A resumed download that
+// when it downloaded or its bytes can't be trusted. A resumed /Data that
 // timed out without getting any further starts over next time, instead of
-// trying the same way again. `resumed` is the number of bytes it started
-// with.
+// trying the same way again. `resumed` is the number of bytes the /Data
+// started from, 0 when it wasn't read.
 static void
 suunto_nautic_resume_update (suunto_nautic_device_t *device, unsigned int id, unsigned int listed,
 	dc_buffer_t *compressed, size_t resumed, dc_status_t status)
@@ -1241,7 +1241,7 @@ suunto_nautic_download (suunto_nautic_device_t *device, dc_event_progress_t *eve
 {
 	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
-	size_t resumed = 0;
+	size_t kept = 0, resumed = 0;
 
 	suunto_nautic_progress_t progress;
 	progress.event = event;
@@ -1263,7 +1263,7 @@ suunto_nautic_download (suunto_nautic_device_t *device, dc_event_progress_t *eve
 	// Fork only: carry on from the /Data an earlier connection received for
 	// this dive, when the caller kept it.
 	if (checked)
-		resumed = suunto_nautic_resume_load (device, id, listed, compressed);
+		kept = suunto_nautic_resume_load (device, id, listed, compressed);
 
 	// The size is filled in once the /Summary is complete.
 	unsigned char header[4] = {0};
@@ -1284,7 +1284,8 @@ suunto_nautic_download (suunto_nautic_device_t *device, dc_event_progress_t *eve
 	size_t summary_size = dc_buffer_get_size (buffer) - sizeof (header);
 	array_uint32_le_set (dc_buffer_get_data (buffer), summary_size);
 
-	// Fork only: the resumed download.
+	// Fork only: the resumed download, which only the /Data can stall.
+	resumed = kept;
 	if (resumed)
 		status = suunto_nautic_resume (device, data_path, id, summary_size, &progress, compressed);
 	else
