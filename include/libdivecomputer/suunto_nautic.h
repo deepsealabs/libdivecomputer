@@ -114,9 +114,10 @@ suunto_nautic_device_download_summary (dc_device_t *device, const char *logbook_
 /*
  * Download and decompress a specific logbook entry, given its numeric
  * id as it appears in a "/Logbook/byId/<id>/..." path (e.g.
- * "1787752091"). On success, `raw` holds the decompressed /Data stream as
- * downloaded, with the /Summary SBEM appended, for
- * suunto_nautic_parser_create(), which checks the SBEM0103 magic.
+ * "1787752091"). On success, `raw` holds the dive as dc_device_foreach()
+ * delivers it, for suunto_nautic_parser_create(): SUMMARY_SIZE(4) SUMMARY
+ * PROFILE, the /Summary SBEM with its size in front (uint32 LE), then the
+ * decompressed /Data stream.
  *
  * The download is checked against the size /Logbook/Entries lists for the
  * id. A download that doesn't match it, like any other failure, returns an

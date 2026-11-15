@@ -40,7 +40,7 @@
  *   - GET /Logbook/byId/<id>/Data, SUBSCRIBE: the watch streams the
  *     compressed dive in unacknowledged notifications (0x01), each with
  *     its offset in the stream, and ends with a zero length chunk at the
- *     total size. Then UNSUBSCRIBE and RELEASE.
+ *     total size, sent twice. Then UNSUBSCRIBE and RELEASE.
  *   - A lost chunk isn't sent again. After the UNSUBSCRIBE, the same handle
  *     serves the rest in pages, like /Summary, from the offset of the
  *     first byte missing.
@@ -49,20 +49,22 @@
  *     stream is an SBEM0103 container.
  *   - GET /Logbook/byId/<id>/Summary, FETCH page by page: an uncompressed
  *     SBEM0103 container with the fields that are not in the profile
- *     (gradient factors, gas mixes). It is appended to the profile.
+ *     (gradient factors, gas mixes). It is downloaded first, and stored in
+ *     front of the profile, with its size: SUMMARY_SIZE(4) SUMMARY PROFILE.
  *
  * SBEM0103 container:
- *   - A numeric Type-Length-Value stream: [id: 1 byte][length: 1 byte]
- *     [value: length bytes]; length == 255 means an extended 4-byte LE
- *     length follows before the value. Unknown chunk IDs are skipped.
- *   - Decoded chunks (suunto_nautic_parser.c): 0x12 (1Hz absolute
- *     pressure / temperature), 0x16 (depth, cylinder pressures, NDL,
- *     time-to-surface), 0x0B (GPS), 0x17 (surface pressure ->
- *     DC_FIELD_ATMOSPHERIC), plus dive events and high-rate IMU.
+ *   - An 8-byte header (SBEM0103), then chunks ID LENGTH DATA(LENGTH). The
+ *     id is one byte, or 0xFF and a uint16 LE id; the length is one byte,
+ *     or 0xFF and a uint32 LE length. Unknown chunk IDs are skipped.
+ *   - Decoded chunks (suunto_nautic_parser.c): 0x01 (timeline base),
+ *     0x12 (1Hz absolute pressure / temperature), 0x16 (depth, cylinder
+ *     pressures, NDL, time-to-surface), 0x0B (GPS), 0x17 (surface
+ *     pressure -> DC_FIELD_ATMOSPHERIC), plus dive events and high-rate
+ *     IMU. The ids from 0x20 up aren't fixed, see the parser.
  *   - Series libdivecomputer has no sample type for (battery, GPS
- *     accuracy, 9-axis IMU, dive-route features) are emitted through
- *     DC_SAMPLE_VENDOR tagged SAMPLE_VENDOR_SUUNTO_NAUTIC, each record
- *     led by a VENDOR_KIND_* byte.
+ *     accuracy, 9-axis IMU, dive-route features, gradient factors) are
+ *     emitted through DC_SAMPLE_VENDOR tagged SAMPLE_VENDOR_SUUNTO_NAUTIC,
+ *     each record led by a VENDOR_KIND_* byte.
  *
  * Enumeration:
  *   - /Logbook/Entries lists the dives, oldest first and in pages. Each
@@ -71,20 +73,12 @@
  *     newest first, stopping at the first id matching the fingerprint.
  *
  * Datetime:
- *   - The stream carries no wall-clock timestamp except in GPS fixes
- *     (chunk 0x0B), which hold an absolute UTC in milliseconds, so
- *     dc_parser_get_datetime() derives start = gps_utc - gps_rel_time.
- *     A dive with no surface GPS fix has no absolute clock in the
- *     stream; datetime is unsupported for it. The LogId (the dive id) is
- *     itself that timestamp and can serve as a fallback.
- *
- * Resynchronisation:
- *   - Heatshrink decompression can leave localized artifacts (runs of a
- *     repeated byte) that a naive TLV walk would misread as a chunk
- *     header and desync on. suunto_nautic_sbem_next() validates every
- *     fixed-length chunk id (0x08=6, 0x0B=20, 0x0E=6, 0x14=7, 0x16=195,
- *     0x17=14 bytes) against its expected length and, on a mismatch,
- *     rescans forward one byte at a time instead of trusting the header.
+ *   - The profile starts with the timeline base (chunk 0x01): the local
+ *     time of the dive start in milliseconds, in its low 7 bytes, and the
+ *     UTC offset of the watch in quarter hours, as an int8, in its top
+ *     byte. dc_parser_get_datetime() returns that local time, with the
+ *     offset as the time zone. The local time minus the offset is about
+ *     a second after the dive id, at most.
  */
 
 #ifndef SUUNTO_NAUTIC_H

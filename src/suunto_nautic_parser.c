@@ -20,47 +20,40 @@
  */
 
 /*
- * Parses the SBEM0103 TLV stream produced by
- * suunto_nautic_device_download() after MDS-chunk extraction and
- * Heatshrink decompression (see suunto_nautic.c/.h). The format is:
+ * Parses the dives stored by suunto_nautic_device_foreach(): the /Summary
+ * and the decompressed /Data, both SBEM containers (see suunto_nautic.h).
+ * A container is an 8-byte header (SBEM0103) and a series of chunks:
  *
- *   [chunk id: 1 byte][length: 1 byte][value: length bytes]
- *   length == 255 means an extended 4-byte little-endian length follows
- *   immediately, before the value.
+ *   ID LENGTH DATA(LENGTH)
  *
- * Decoded chunks: 0x12 (1Hz absolute pressure / temperature), 0x16
- * (depth, cylinder pressures, gas time remaining, NDL, time-to-surface),
- * 0x17 (surface pressure), 0x0B (GPS), 0x0F (heart rate, Ocean only),
- * 0x08 (activity -> dive mode), plus the dynamically-assigned dive-event
- * subgroups. Chunks 0x0E (satellite
- * info) and 0x14 (battery) have fixed lengths that are used for resync
- * (see suunto_nautic_sbem_fixed_length) but map to no dc_field/dc_sample
- * and are not otherwise decoded. Chunks 0x23/0x24 are raw accelerometer /
- * gyroscope dumps for client-side dead reckoning, emitted through
- * DC_SAMPLE_VENDOR. Unknown chunk ids are skipped, so extending the
- * decoder is additive.
+ * The id is one byte, or 0xFF and the id as a uint16 LE; the length is one
+ * byte, or 0xFF and the length as a uint32 LE.
+ *
+ * Decoded chunks: 0x01 (timeline base), 0x12 (1Hz absolute pressure /
+ * temperature), 0x16 (depth, cylinder pressures, gas time remaining, NDL,
+ * time-to-surface, gradient factors), 0x17 (surface pressure), 0x0B (GPS),
+ * 0x0F (heart rate, Ocean only), 0x08 (activity -> dive mode), plus the
+ * dive-event groups. The GPS accuracy (0x0E), the battery (0x14), the raw
+ * IMU and the dive route features (see suunto_nautic_layout_t) map to no
+ * dc_field or dc_sample, and are emitted through DC_SAMPLE_VENDOR. Unknown
+ * chunk ids are skipped, so extending the decoder is additive.
  *
  * Sample time is delta-encoded: every chunk except the timeline base
- * (0x01) begins with a signed int16 LE millisecond delta. The dive start
- * time (dc_parser_get_datetime()) is reconstructed from the only absolute
- * clock in the stream: each GPS fix (chunk 0x0B) carries an absolute UTC
- * in milliseconds, so start = gps_utc - gps_relative_time. A dive with no
- * surface GPS fix has no absolute clock, so datetime is unsupported for it.
+ * (0x01) begins with a signed int16 LE millisecond delta. The timeline base
+ * is the first chunk, and holds the local time of the dive start, which is
+ * what dc_parser_get_datetime() returns, with the UTC offset of the watch as
+ * the time zone.
  */
 
 #include <string.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <math.h>
+#include <limits.h>
 
 #include "suunto_nautic.h"
 #include "context-private.h"
 #include "parser-private.h"
 #include "array.h"
 
-#define SBEM_MAGIC_SIZE 8
-
-#define CHUNK_TIMELINE_BASE   0x01
+#define CHUNK_TIMELINE_BASE   0x01 // [localtime:7 ms LE][utcoffset:int8, quarter hours]
 #define CHUNK_ACTIVITY        0x08 // [timeDelta:2][sportId:1][customModeId: ascii]
 // Suunto sport ids seen on the Nautic/Ocean, from the app's ActivityType:
 // 51 = scuba, 61 = free diving, 62 = mermaiding. Only the last two are apnea.
@@ -70,19 +63,9 @@
 #define CHUNK_GPS_ACCURACY    0x0E // [timeDelta:2][dEHPE:int8][dEVPE:int8][?:2]
 #define CHUNK_HEARTRATE       0x0F // [timeDelta:2][hr:uint8 bpm] -- Ocean wrist HR only
 #define CHUNK_BATTERY         0x14 // [timeDelta:2][current:int16][voltage:uint16 mV][charge:uint8 %]
-// High-rate IMU: [timeDelta:2][algoTS:uint32][accel/gyro/mag X,Y,Z:int16], a
-// 24-byte payload. The chunk id is FIRMWARE-DEPENDENT: 0x23 on the 195-byte
-// extended-status watches (Nautic), 0x22 on the 141-byte ones (Nautic S /
-// Ocean). Both are matched by (id in {0x22,0x23} AND payload >= 24); see the
-// IMU handler. Keying on the id alone silently dropped IMU on 141-byte watches.
-#define CHUNK_IMU             0x23
-#define CHUNK_IMU_ALT         0x22
-// DiveRouteFeatures: 5x uint16 (16-byte payload), id 0x24 on 195-byte watches
-// and 0x23 (small) on 141-byte ones. These are input features to the app's
-// dive-route tracking algorithm, not the resulting X/Y/Z track (which the
-// device doesn't store; the app dead-reckons it from the raw IMU above). The
-// meaning of the individual features is unknown; they are carried through.
-#define CHUNK_DIVEROUTE_FEATURES 0x24
+// The chunks from 0x20 up are in suunto_nautic_layout_t.
+#define IMU_SIZE              24 // [timeDelta:2][algoTS:uint32][accel/gyro/mag X,Y,Z:int16]
+#define FEATURES_SIZE         16 // [timeDelta:2][?:4][f0..f4:uint16]
 
 // libdivecomputer has no dedicated battery/GPS-accuracy/IMU sample types, so
 // these are delivered through the generic DC_SAMPLE_VENDOR channel tagged
@@ -92,12 +75,15 @@
 #define VENDOR_KIND_GPS_ACCURACY 2 // [ehpe_m:u16][evpe_m:u16]
 #define VENDOR_KIND_IMU          3 // [ax,ay,az,gx,gy,gz,mx,my,mz:int16]
 #define VENDOR_KIND_DIVEROUTE_FEATURES 4 // [f0,f1,f2,f3,f4:uint16] DiveRouteFeatures (algo inputs; not the X/Y/Z track)
-#define VENDOR_KIND_GF           5 // [gf99:int16][gf_surface:int16][gf_leading:int16] (%)
+#define VENDOR_KIND_GF           5 // [gf99:int16][gf_surface:int16] (%)
 #define CHUNK_PROFILE_1HZ     0x12
-#define CHUNK_EXTENDED_STATUS 0x16 // VARIABLE length (195 on Ocean/Nautic, 141
-                                   // on Nautic S and other firmware); fields are
-                                   // read by offset, each guarded by chunk.size.
-                                   // Deliberately not in the fixed-length table.
+#define CHUNK_EXTENDED_STATUS 0x16
+// The extended status holds the cylinder records at 42, as many as the layout
+// has gases, then the real-time GF99 and surface GF (int32, %) and one byte
+// of unknown meaning: 141 bytes with 5 cylinders, 195 with 8.
+#define STATUS_CYLINDERS  42
+#define CYLINDER_SIZE     18
+#define STATUS_SIZE(n)    (STATUS_CYLINDERS + (n) * CYLINDER_SIZE + 9)
 #define CHUNK_SURFACE_PRESSURE 0x17
 // Dive-event groups: the chunk id IS the event subgroup, each record is
 // [timeDelta:2 LE][Type:1][Active:1] (Active 1=begin/onset, 0=end/cleared).
@@ -107,109 +93,138 @@
 #define CHUNK_EVENT_NOTIFY    0x1A
 #define CHUNK_EVENT_STATE     0x1B
 #define CHUNK_DIVE_STATE      0x1C // [timeDelta:2][state:1]; 0=Idling,1=Diving,2=Recovering
-#define CHUNK_DIVE_STATUS     0x1E // [timeDelta:2][active:1]; the DiveActive flag
 #define CHUNK_OOAM            0x1D // [timeDelta:2][type:1]; one-shot dive-end reason (Ooam.Type)
 #define CHUNK_GAS_SWITCH      0x1F // [timeDelta:2][gasnumber:int16 LE]
 
 // DiveState values (CHUNK_DIVE_STATE payload).
 #define DIVE_STATE_IDLING     0
 #define DIVE_STATE_DIVING     1
-#define DIVE_STATE_RECOVERING 2
 
 #define MAX_TANKS 8
-#define MAX_GASMIXES 4
+#define MAX_GASMIXES 8
 
-// Field offsets within the /Summary SBEM0103 section (relative to its
-// "SBEM0103" signature), confirmed against real hardware. The dive profile
-// (/Data) carries samples but not these; the driver appends the /Summary
-// SBEM after the profile so this parser can expose them the standard way.
-// GF low is at 0x35 and GF high at 0x33 (uint16 LE, %). This ordering yields
-// valid low <= high on two devices (Nautic 35/75, Nautic S 40/85); the reverse
-// gives low > high.
-#define SUMMARY_GF_LOW   0x35 // uint16 LE, %
-#define SUMMARY_GF_HIGH  0x33 // uint16 LE, %
-// Water type (uint8): 0 fresh, 1 EN13319, 2 salt.
-#define SUMMARY_WATER_TYPE 0x3E
-// Gas/cylinder records: an array starting at SUMMARY_GAS_BASE, one 45-byte
-// record per configured gas. The record index equals the cylinder slot /
-// GasNumber, so tank i uses gas i. Within a record: O2% (int16 LE) at +1,
-// He% (int16 LE) at +3, PO2-max (float32 LE, bar) at +5, cylinder water
-// capacity (float32 LE, m^3) at +9, as the watch's own /Summary schema lays
-// them out. Confirmed on two real dual-gas dives (Air 12 L + NX26 5.7 L, two
-// transmitters -- issue #29/#33/#34); a lone gas dive stops at the first
-// implausible slot, as before.
-#define SUMMARY_GAS_BASE   0xC7
-#define SUMMARY_GAS_STRIDE 45
-#define SUMMARY_GAS_O2     1  // int16 LE, %
-#define SUMMARY_GAS_HE     3  // int16 LE, %
-#define SUMMARY_GAS_VOLUME 9  // float32 LE, m^3
-// The dive record, the last /Summary record long enough to hold these, carries
-// the watch's own dive time and maximum depth (the app's DiveTime and
-// Depth.Max), at the same payload offsets on 2040, 2056 and 2342 B summaries,
-// along with the app's DepthAverage (diving only) and Temperature.Min/Max.
-#define SUMMARY_DIVE_TEMP_MIN 313 // float32 LE, K
-#define SUMMARY_DIVE_TEMP_MAX 317 // float32 LE, K
-#define SUMMARY_DIVE_DIVETIME 321 // float32 LE, s, fractional
-#define SUMMARY_DIVE_MAXDEPTH 330 // float32 LE, m
-#define SUMMARY_DIVE_AVGDEPTH 338 // float32 LE, m
-// The DiveFooter (the second record) repeats the gas records from +282, with
-// each transmitter's start/end pressure: tank 1 at +25/+29, tank 2 at +33/+37
-// (int32 LE, Pa). The end pressures are the app's; the start pressures keep a
-// transmitter's pre-pairing dropout value (9 bar on 1788683271), so they aren't used.
-#define SUMMARY_FOOTER_RECORD   1
-// Records 2-4 are the Windows; each carries Temperature.Min/Max (float32 LE, K)
-// in the order its schema gives, on both watches. The dive record's pair above is
-// reversed by Ocean firmware, so the Windows are read first.
-#define SUMMARY_WINDOW_FIRST    2
-#define SUMMARY_WINDOW_COUNT    3
-#define SUMMARY_WINDOW_TEMP_MIN 101
-#define SUMMARY_WINDOW_TEMP_MAX 105
-#define SUMMARY_FOOTER_GAS_BASE 282
-#define SUMMARY_FOOTER_GAS_END1 29
-#define SUMMARY_FOOTER_GAS_END2 37
+// The /Summary SBEM section starts with the dive header, with the settings
+// the dive was made with, which the profile (/Data) doesn't carry. The
+// driver stores the /Summary in front of the profile so this parser can
+// expose them the standard way. Its id depends on the layout, and the fields
+// decoded so far are at the same place in both:
+#define HEADER_GF_HIGH     37 // uint16 LE, %
+#define HEADER_GF_LOW      39 // uint16 LE, %
+#define HEADER_WATER_TYPE  48 // uint8 enum: 0 fresh, 1 EN13319, 2 salt
+// GF low is at +39 and GF high at +37. This ordering yields valid low <= high
+// on two devices (Nautic 35/75, Nautic S 40/85); the reverse gives low > high.
+// Gas records: an array at HEADER_GAS, one 45-byte record for each gas of
+// the layout. The record index equals the cylinder slot (GasNumber), so tank
+// i uses gas i. Within a record: O2% at +1, He% at +3, the configured PO2 max
+// (float32 LE, bar) at +5, and cylinder water capacity (float32 LE, m^3) at
+// +9. The records of the unused gases are zero, after the used ones.
+#define HEADER_GAS        185
+#define HEADER_GAS_SIZE   45
+#define GAS_O2            1  // uint16 LE, %
+#define GAS_HE            3  // uint16 LE, %
+#define GAS_PO2MAX        5  // float32 LE, bar
+#define GAS_VOLUME        9  // float32 LE, m^3
 
+// The ids from 0x20 up aren't fixed: the descriptors the watch serves with
+// each dive assign them. Two sets have been seen, in which each of those ids
+// differs by one, in the /Summary and in the profile alike: on the Nautic S
+// and the Ocean (firmware 2.51 to 2.54), and on the Nautic (2.55.46). The id
+// of the dive header, the first chunk of the /Summary, tells them apart.
+typedef struct suunto_nautic_layout_t {
+	unsigned int header;   // the dive header
+	unsigned int ngases;   // its gas records, and the cylinders in 0x16
+	unsigned int imu;      // the raw IMU, IMU_SIZE bytes
+	unsigned int features; // the dive route features, FEATURES_SIZE bytes
+} suunto_nautic_layout_t;
+
+static const suunto_nautic_layout_t suunto_nautic_layouts[] = {
+	{0x20, 5, 0x22, 0x23},
+	{0x21, 8, 0x23, 0x24},
+};
+
+// The values are kept in the units of the device, and converted when they
+// are returned.
 typedef struct suunto_nautic_tank_t {
 	unsigned int used;
-	double beginpressure; // bar
-	double endpressure;   // bar
+	unsigned int beginpressure; // Pa
+	unsigned int endpressure;   // Pa
 	unsigned int gasmix;  // gas index (== cylinder slot / GasNumber)
-	unsigned int field;   // 0 = Pressure (first transmitter), 1 = Pressure2
 } suunto_nautic_tank_t;
+
+typedef struct suunto_nautic_gasmix_t {
+	unsigned int oxygen; // %
+	unsigned int helium; // %
+	double volume;       // cylinder water capacity, m^3 (0 = unknown)
+} suunto_nautic_gasmix_t;
 
 typedef struct suunto_nautic_parser_t {
 	dc_parser_t base;
 	unsigned int cached;
-	unsigned int divetime; // seconds
-	double maxdepth;       // meters
-	double avgdepth;       // meters
+	const suunto_nautic_layout_t *layout;
+	long long divetime;    // ms
+	double maxdepth;       // m
+	double depth_sum;      // m, over the Diving samples
+	unsigned int depth_count;
 	unsigned int have_temperature;
-	double temperature_surface; // first (surface) reading
-	double temperature_minimum;
-	double temperature_maximum;
+	unsigned int temperature_surface; // 0.01 K, the first (surface) reading
+	unsigned int temperature_minimum;
+	unsigned int temperature_maximum;
 	unsigned int ntanks;
 	suunto_nautic_tank_t tank[MAX_TANKS];
 	unsigned int have_location;
-	dc_location_t location;
+	int latitude;  // 1e-7 degrees
+	int longitude; // 1e-7 degrees
 	unsigned int have_atmospheric;
-	double atmospheric; // bar
+	double atmospheric; // Pa
 	unsigned int have_datetime;
-	dc_ticks_t datetime; // dive start, UNIX seconds
-	dc_divemode_t divemode; // from the CHUNK_ACTIVITY sport id; OC unless apnea
-	// From the /Summary SBEM section appended after the profile, if present.
+	dc_ticks_t datetime; // dive start, local time, ms
+	int timezone;        // UTC offset, quarter hours
+	unsigned int have_sport;
+	unsigned int sport; // the CHUNK_ACTIVITY sport id
+	// From the /Summary SBEM section in front of the profile.
 	unsigned int ngasmixes;
-	dc_gasmix_t gasmix[MAX_GASMIXES];
-	double gasvolume[MAX_GASMIXES]; // cylinder water capacity, litres (0 = unknown)
-	unsigned int have_decomodel;
-	dc_decomodel_t decomodel;
-	unsigned int have_salinity;
-	dc_salinity_t salinity;
+	suunto_nautic_gasmix_t gasmix[MAX_GASMIXES];
+	unsigned int have_gf;
+	unsigned int gf_low;  // %
+	unsigned int gf_high; // %
+	unsigned int have_ppo2max;
+	double ppo2max; // bar, configured oxygen partial-pressure limit
+	unsigned int have_watertype;
+	unsigned int watertype; // 0 fresh, 1 EN13319, 2 salt
 } suunto_nautic_parser_t;
 
-typedef struct sbem_chunk_t {
-	unsigned int id;
-	const unsigned char *data;
-	unsigned int size;
-} sbem_chunk_t;
+typedef dc_status_t (*suunto_nautic_sbem_callback_t) (dc_context_t *context, unsigned int id, const unsigned char data[], unsigned int size, void *userdata);
+
+// The state of the walk over the profile, besides the fields it fills in.
+typedef struct suunto_nautic_profile_t {
+	suunto_nautic_parser_t *parser;
+	dc_sample_callback_t callback;
+	void *userdata;
+	// The sum of the time deltas, and the sample time, which never goes
+	// back: the GPS chunks rewind the sum by a few hundred ms.
+	long long time_ms;
+	long long sample_ms;
+	long long emitted_ms; // the time of the last sample, or -1
+	// The dive time is the total time in the Diving state, as in the app,
+	// and the average depth is taken over that time only.
+	unsigned int dive_state;
+	long long diving_start_ms;
+	long long total_dive_ms;
+	// The tank of each pressure field of each cylinder, Pressure and
+	// Pressure2 (a second transmitter), or -1. A cylinder without a second
+	// transmitter can report a single non-zero Pressure2, so Pressure2 only
+	// makes a tank from its second non-zero value, and p2_first holds the
+	// first one.
+	int tankmap[MAX_TANKS * 2];
+	int p2_first[MAX_TANKS];
+	// The GPS position errors, summed from the deltas in chunk 0x0E.
+	int ehpe, evpe;
+} suunto_nautic_profile_t;
+
+typedef struct suunto_nautic_summary_t {
+	suunto_nautic_parser_t *parser;
+	unsigned int nchunks;
+} suunto_nautic_summary_t;
 
 static dc_status_t suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime);
 static dc_status_t suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value);
@@ -226,6 +241,693 @@ static const dc_parser_vtable_t suunto_nautic_parser_vtable = {
 	suunto_nautic_parser_samples_foreach,
 	NULL, /* destroy */
 };
+
+// Walk the chunks of an SBEM container, and pass each one to the callback.
+// The container starts with an 8-byte header (SBEM0103), and every chunk is
+// ID LENGTH DATA(LENGTH). The id is one byte, or 0xFF and the id as a uint16;
+// the length is one byte, or 0xFF and the length as a uint32.
+static dc_status_t
+suunto_nautic_sbem_parse (dc_context_t *context, const unsigned char data[], unsigned int size, suunto_nautic_sbem_callback_t callback, void *userdata)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	unsigned int offset = 0;
+
+	if (offset + 8 > size) {
+		ERROR (context, "Buffer overflow detected (%08x).", offset);
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	if (memcmp (data, "SBEM", 4) != 0) {
+		ERROR (context, "Unexpected SBEM header.");
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	offset += 8;
+
+	while (offset < size) {
+		unsigned int header = 0;
+
+		// Read the chunk id.
+		if (offset + header + 1 > size) {
+			ERROR (context, "Buffer overflow detected (%08x).", offset);
+			return DC_STATUS_DATAFORMAT;
+		}
+		unsigned int id = data[offset + header];
+		header++;
+		if (id == 0xFF) {
+			if (offset + header + 2 > size) {
+				ERROR (context, "Buffer overflow detected (%08x).", offset);
+				return DC_STATUS_DATAFORMAT;
+			}
+			id = array_uint16_le (data + offset + header);
+			header += 2;
+		}
+
+		// Read the chunk length.
+		if (offset + header + 1 > size) {
+			ERROR (context, "Buffer overflow detected (%08x).", offset);
+			return DC_STATUS_DATAFORMAT;
+		}
+		unsigned int length = data[offset + header];
+		header++;
+		if (length == 0xFF) {
+			if (offset + header + 4 > size) {
+				ERROR (context, "Buffer overflow detected (%08x).", offset);
+				return DC_STATUS_DATAFORMAT;
+			}
+			length = array_uint32_le (data + offset + header);
+			header += 4;
+		}
+
+		// Check the chunk length. The checks above guarantee offset + header
+		// <= size, and comparing the remainder can't overflow, unlike
+		// offset + header + length with a 32-bit length.
+		if (length > size - offset - header) {
+			ERROR (context, "Buffer overflow detected (%08x).", offset);
+			return DC_STATUS_DATAFORMAT;
+		}
+
+		status = callback (context, id, data + offset + header, length, userdata);
+		if (status != DC_STATUS_SUCCESS)
+			return status;
+
+		offset += header + length;
+	}
+
+	return status;
+}
+
+// Decode gradient factors, water type, gas mixes and per-gas cylinder size
+// from the dive header, the first chunk of the /Summary; the other chunks
+// aren't decoded.
+static dc_status_t
+suunto_nautic_parser_summary (dc_context_t *context, unsigned int id, const unsigned char data[], unsigned int size, void *userdata)
+{
+	suunto_nautic_summary_t *s = (suunto_nautic_summary_t *) userdata;
+	suunto_nautic_parser_t *parser = s->parser;
+
+	if (s->nchunks++ != 0)
+		return DC_STATUS_SUCCESS;
+
+	for (unsigned int i = 0; i < C_ARRAY_SIZE (suunto_nautic_layouts); i++) {
+		if (suunto_nautic_layouts[i].header == id) {
+			parser->layout = suunto_nautic_layouts + i;
+			break;
+		}
+	}
+
+	if (parser->layout == NULL) {
+		ERROR (context, "Unexpected dive header id (%02x).", id);
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	if (size < HEADER_GAS + parser->layout->ngases * HEADER_GAS_SIZE) {
+		ERROR (context, "Unexpected dive header size (%u).", size);
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	parser->gf_low = array_uint16_le (data + HEADER_GF_LOW);
+	parser->gf_high = array_uint16_le (data + HEADER_GF_HIGH);
+	parser->have_gf = 1;
+
+	unsigned int watertype = data[HEADER_WATER_TYPE];
+	if (watertype <= 2) {
+		parser->watertype = watertype;
+		parser->have_watertype = 1;
+	}
+
+	for (unsigned int i = 0; i < parser->layout->ngases; i++) {
+		const unsigned char *gas = data + HEADER_GAS + i * HEADER_GAS_SIZE;
+		unsigned int o2 = array_uint16_le (gas + GAS_O2);
+		unsigned int he = array_uint16_le (gas + GAS_HE);
+		if (o2 == 0 && he == 0)
+			continue;
+		// The gas index is the record index, so a gas can't follow an
+		// unused record.
+		if (i != parser->ngasmixes || o2 == 0 || o2 > 100 || he > 100 - o2) {
+			ERROR (context, "Unexpected gas mix %u (%u %u).", i, o2, he);
+			return DC_STATUS_DATAFORMAT;
+		}
+		unsigned int g = parser->ngasmixes;
+		parser->gasmix[g].oxygen = o2;
+		parser->gasmix[g].helium = he;
+		// Per-gas cylinder water capacity (float32 m^3), when it is
+		// physically sane.
+		double volume = array_float_le (gas + GAS_VOLUME);
+		if (volume > 0.0 && volume < 1.0)
+			parser->gasmix[g].volume = volume;
+		// The configured PO2 max (float32 bar) is a single watch setting held
+		// in the first gas record. Record it once, when physically sane.
+		if (g == 0) {
+			double ppo2 = array_float_le (gas + GAS_PO2MAX);
+			if (ppo2 >= 0.5 && ppo2 <= 3.0) {
+				parser->ppo2max = ppo2;
+				parser->have_ppo2max = 1;
+			}
+		}
+		parser->ngasmixes++;
+	}
+
+	return DC_STATUS_SUCCESS;
+}
+
+// Map a dive event to the closest dc_sample_event_t. The chunk id is the
+// event group (0x18 Alarm, 0x19 Warning, 0x1A Notify, 0x1B State, 0x1D
+// Ooam), and the type indexes the enum of that group, as listed in the
+// descriptors the watch serves with each dive. Many types have no
+// equivalent and map to SAMPLE_EVENT_NONE, which isn't emitted. An unknown
+// alarm is a SAMPLE_EVENT_VIOLATION, because the alarms are the serious
+// ones, and any other unknown type is SAMPLE_EVENT_NONE.
+static unsigned int
+suunto_nautic_map_event (unsigned int chunk_id, unsigned int type)
+{
+	switch (chunk_id) {
+	case CHUNK_EVENT_ALARM: // red alerts
+		switch (type) {
+		case 1: case 2: return SAMPLE_EVENT_PO2;                 // PO2 Low / High
+		case 3:         return SAMPLE_EVENT_AIRTIME;             // Tank Pressure
+		case 4:         return SAMPLE_EVENT_AIRTIME;             // Gas Time
+		case 5:         return SAMPLE_EVENT_ASCENT;              // Ascent Speed
+		case 7: case 8: return SAMPLE_EVENT_OLF;                 // CNS 100% / OTU 300
+		case 10:        return SAMPLE_EVENT_CEILING;             // Deco Stop Broken
+		case 12:        return SAMPLE_EVENT_DEEPSTOP;            // Deep Stop Broken
+		case 13:        return SAMPLE_EVENT_SAFETYSTOP_MANDATORY;// Safety Stop Broken
+		case 31:        return SAMPLE_EVENT_MAXDEPTH;            // Depth
+		case 50:        return SAMPLE_EVENT_NONE;                // Battery
+		default:        return SAMPLE_EVENT_VIOLATION;
+		}
+	case CHUNK_EVENT_WARNING: // yellow advisories
+		switch (type) {
+		case 6:          return SAMPLE_EVENT_PO2;                // User PO2 High
+		case 14: case 15:return SAMPLE_EVENT_OLF;               // CNS 80% / OTU 250
+		case 28: case 29:return SAMPLE_EVENT_AIRTIME;           // User Tank Pressure / Gas Time
+		case 32:         return SAMPLE_EVENT_DIVETIME;          // Dive Time
+		default:         return SAMPLE_EVENT_NONE;              // 20 NoDecoTime, 30 Sidemount, 31 Depth,
+		                                                        // 42 User Ndl, 44 Recovery, 50 Battery
+		}
+	case CHUNK_EVENT_STATE: // deco / stop transitions
+		switch (type) {
+		case 35:        return SAMPLE_EVENT_DECOSTOP;            // At Deco Stop (reached)
+		case 36:        return SAMPLE_EVENT_DEEPSTOP;            // At Deep Stop (reached)
+		case 37:        return SAMPLE_EVENT_SAFETYSTOP;          // At Safety Stop (reached)
+		default:        return SAMPLE_EVENT_NONE;                // 19 Ndl exceeded, 38/39/40 "... Ahead"
+		}
+	case CHUNK_EVENT_NOTIFY: // status notifications
+		switch (type) {
+		case 28: case 29:return SAMPLE_EVENT_AIRTIME;           // User Tank Pressure / Gas Time
+		case 32:        return SAMPLE_EVENT_DIVETIME;            // Dive Time
+		default:        return SAMPLE_EVENT_NONE;                // 11 Gas Switch, 21 Setpoint, 41 Stop done, 42 User Ndl,
+		                                                        // 60/61 Bearing, 62/63 Stopwatch, ...
+		}
+	case CHUNK_OOAM: // dive-end reason
+		switch (type) {
+		case 2:         return SAMPLE_EVENT_CEILING;             // Ceiling broken
+		case 4:         return SAMPLE_EVENT_MAXDEPTH;            // Max depth
+		default:        return SAMPLE_EVENT_NONE;                // 1 Battery, 3 SW crash, 5 Algo, 6 Gauge
+		}
+	default:
+		return SAMPLE_EVENT_NONE;
+	}
+}
+
+// Start a sample at the current time, unless the previous values were at
+// the same time already. All the values of one time are a single sample.
+static void
+suunto_nautic_emit_time (suunto_nautic_profile_t *s)
+{
+	if (s->sample_ms == s->emitted_ms)
+		return;
+
+	dc_sample_value_t sample = {0};
+	sample.time = (unsigned int) s->sample_ms;
+	if (s->callback) s->callback (DC_SAMPLE_TIME, &sample, s->userdata);
+	s->emitted_ms = s->sample_ms;
+}
+
+// Emit a Suunto-Nautic vendor record at the current time. Every such
+// record starts with a VENDOR_KIND_* byte so a single vendor type can carry
+// several kinds of non-standard telemetry (battery, GPS accuracy, IMU, ...).
+static void
+suunto_nautic_emit_vendor (suunto_nautic_profile_t *s, const unsigned char *rec, unsigned int size)
+{
+	dc_sample_value_t sample = {0};
+	suunto_nautic_emit_time (s);
+	sample.vendor.type = SAMPLE_VENDOR_SUUNTO_NAUTIC;
+	sample.vendor.size = size;
+	sample.vendor.data = rec;
+	if (s->callback) s->callback (DC_SAMPLE_VENDOR, &sample, s->userdata);
+}
+
+static dc_status_t
+suunto_nautic_parser_profile (dc_context_t *context, unsigned int id, const unsigned char data[], unsigned int size, void *userdata)
+{
+	suunto_nautic_profile_t *s = (suunto_nautic_profile_t *) userdata;
+	suunto_nautic_parser_t *parser = s->parser;
+	const suunto_nautic_layout_t *layout = parser->layout;
+
+	// Advance the clock by this chunk's leading ms delta (all groups
+	// except the timeline base carry one).
+	if (id != CHUNK_TIMELINE_BASE) {
+		if (size < 2) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		s->time_ms += (signed short) array_uint16_le (data);
+	}
+	if (s->time_ms > s->sample_ms)
+		s->sample_ms = s->time_ms;
+
+	// The time is summed in a wider type, so a long run of deltas can't
+	// overflow it, but a sample can only carry 32 bits of milliseconds.
+	if (s->sample_ms > UINT_MAX) {
+		ERROR (context, "Unexpected sample time.");
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	if (id == CHUNK_TIMELINE_BASE) {
+		if (size < 8) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		if (!parser->have_datetime) {
+			parser->datetime = (dc_ticks_t) (array_uint64_le (data) & 0x00FFFFFFFFFFFFFFULL);
+			parser->timezone = (signed char) data[7];
+			parser->have_datetime = 1;
+		}
+	} else if (id == CHUNK_PROFILE_1HZ) {
+		if (size < 18) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		unsigned int temperature = array_uint16_le (data + 16);
+
+		if (!parser->have_temperature) {
+			// The first reading is taken at/near the surface at dive start.
+			parser->temperature_surface = temperature;
+			parser->temperature_minimum = parser->temperature_maximum = temperature;
+			parser->have_temperature = 1;
+		} else {
+			if (temperature < parser->temperature_minimum)
+				parser->temperature_minimum = temperature;
+			if (temperature > parser->temperature_maximum)
+				parser->temperature_maximum = temperature;
+		}
+
+		dc_sample_value_t sample = {0};
+		suunto_nautic_emit_time (s);
+		sample.temperature = temperature / 100.0 - 273.15;
+		if (s->callback) s->callback (DC_SAMPLE_TEMPERATURE, &sample, s->userdata);
+	} else if (id == CHUNK_EXTENDED_STATUS) {
+		unsigned int ncylinders = layout->ngases;
+		if (size != STATUS_SIZE (ncylinders)) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+
+		double depth = array_float_le (data + 2);
+
+		if (depth > parser->maxdepth)
+			parser->maxdepth = depth;
+		// Average only over the Diving phase (matches the app).
+		if (s->dive_state == DIVE_STATE_DIVING) {
+			parser->depth_sum += depth;
+			parser->depth_count++;
+		}
+
+		dc_sample_value_t sample = {0};
+		suunto_nautic_emit_time (s);
+		sample.depth = depth;
+		if (s->callback) s->callback (DC_SAMPLE_DEPTH, &sample, s->userdata);
+
+		// A cylinder record is GASNUMBER(1) ?(1) PRESSURE(4) PRESSURE2(4)
+		// GASTIME(4) ..., with the pressures in Pa. The gas number of every
+		// record is its index, so stop at the first one that isn't.
+		for (unsigned int i = 0; i < ncylinders; i++) {
+			unsigned int base = STATUS_CYLINDERS + i * CYLINDER_SIZE;
+			if (data[base] != i)
+				break;
+
+			// The gas time of the first cylinder, a uint32 in seconds at
+			// +10, as the RBT, like suunto_eonsteel. 0xFFFFFFFF means none.
+			if (i == 0) {
+				unsigned int gastime = array_uint32_le (data + base + 10);
+				if (gastime != 0xFFFFFFFF && gastime != 0) {
+					suunto_nautic_emit_time (s);
+					sample.rbt = gastime / 60;
+					if (s->callback) s->callback (DC_SAMPLE_RBT, &sample, s->userdata);
+				}
+			}
+
+			for (unsigned int field = 0; field < 2; field++) {
+				unsigned int pressure_pa = array_uint32_le (data + base + 2 + field * 4);
+				if (pressure_pa == 0)
+					continue;
+				unsigned int key = i * 2 + field;
+				if (field == 1 && s->tankmap[key] < 0) {
+					if (s->p2_first[i] < 0) {
+						s->p2_first[i] = (int) pressure_pa;
+						continue;
+					}
+				}
+				if (s->tankmap[key] < 0) {
+					if (parser->ntanks >= MAX_TANKS)
+						continue;
+					s->tankmap[key] = (int) parser->ntanks;
+					parser->tank[parser->ntanks].used = 1;
+					parser->tank[parser->ntanks].gasmix = i;
+					parser->tank[parser->ntanks].beginpressure = (field == 1 && s->p2_first[i] >= 0)
+						? (unsigned int) s->p2_first[i] : pressure_pa;
+					parser->ntanks++;
+				}
+				unsigned int t = (unsigned int) s->tankmap[key];
+				parser->tank[t].endpressure = pressure_pa;
+				// The begin pressure is the highest, because a transmitter
+				// that isn't paired yet reports a low value at first.
+				if (pressure_pa > parser->tank[t].beginpressure)
+					parser->tank[t].beginpressure = pressure_pa;
+				suunto_nautic_emit_time (s);
+				sample.pressure.tank = t;
+				sample.pressure.value = pressure_pa / 100000.0;
+				if (s->callback) s->callback (DC_SAMPLE_PRESSURE, &sample, s->userdata);
+			}
+		}
+
+		// Deco fields, the same in both layouts: TTS uint16 at 22 (s), NDL
+		// int16 at 30 (s) and the ceiling float32 at 38 (m).
+		unsigned int tts = array_uint16_le (data + 22);
+		int ndl = (signed short) array_uint16_le (data + 30);
+		double ceiling = array_float_le (data + 38);
+
+		suunto_nautic_emit_time (s);
+
+		dc_sample_value_t deco = {0};
+		if (ceiling > 0.0) {
+			deco.deco.type = DC_DECO_DECOSTOP;
+			deco.deco.depth = ceiling;
+			deco.deco.tts = tts;
+		} else {
+			deco.deco.type = DC_DECO_NDL;
+			deco.deco.time = ndl > 0 ? (unsigned int) ndl : 0;
+			deco.deco.tts = tts;
+		}
+		if (s->callback) s->callback (DC_SAMPLE_DECO, &deco, s->userdata);
+
+		// The real-time gradient factors, after the cylinders, have no
+		// standard sample, so they are a vendor record (kind 5).
+		unsigned int gf = STATUS_CYLINDERS + ncylinders * CYLINDER_SIZE;
+		int gf99 = (signed int) array_uint32_le (data + gf);
+		int gf_surface = (signed int) array_uint32_le (data + gf + 4);
+		unsigned char rec[5];
+		rec[0] = VENDOR_KIND_GF;
+		rec[1] = gf99 & 0xFF;
+		rec[2] = (gf99 >> 8) & 0xFF;
+		rec[3] = gf_surface & 0xFF;
+		rec[4] = (gf_surface >> 8) & 0xFF;
+		suunto_nautic_emit_vendor (s, rec, sizeof (rec));
+	} else if (id == CHUNK_GPS) {
+		if (size < 18) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// Payload: [timeDelta:2][UTC:8 ms LE][lat:4][lon:4]. The first fix
+		// is the location of the dive.
+		int lat_raw = (signed int) array_uint32_le (data + 10);
+		int lon_raw = (signed int) array_uint32_le (data + 14);
+
+		if (!parser->have_location) {
+			parser->have_location = 1;
+			parser->latitude = lat_raw;
+			parser->longitude = lon_raw;
+		}
+
+		dc_sample_value_t sample = {0};
+		suunto_nautic_emit_time (s);
+		sample.location.latitude = lat_raw / 1.0e7;
+		sample.location.longitude = lon_raw / 1.0e7;
+		sample.location.altitude = 0.0;
+		if (s->callback) s->callback (DC_SAMPLE_LOCATION, &sample, s->userdata);
+	} else if (id == CHUNK_DIVE_STATE) {
+		if (size < 3) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		unsigned int new_state = data[2];
+		if (new_state == DIVE_STATE_DIVING && s->dive_state != DIVE_STATE_DIVING) {
+			s->diving_start_ms = s->time_ms;
+		} else if (new_state != DIVE_STATE_DIVING && s->dive_state == DIVE_STATE_DIVING) {
+			if (s->diving_start_ms >= 0)
+				s->total_dive_ms += s->time_ms - s->diving_start_ms;
+			s->diving_start_ms = -1;
+		}
+		s->dive_state = new_state;
+	} else if (id == CHUNK_EVENT_ALARM || id == CHUNK_EVENT_WARNING ||
+			id == CHUNK_EVENT_NOTIFY || id == CHUNK_EVENT_STATE) {
+		if (size < 4) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// [timeDelta:2][Type:1][Active:1]. Only the begin (Active 1) is
+		// emitted, as in the Suunto app, and the value is the group and
+		// the type, (chunk_id << 8 | type), for the exact event.
+		if (data[3]) {
+			unsigned int mapped = suunto_nautic_map_event (id, data[2]);
+			if (mapped != SAMPLE_EVENT_NONE) {
+				dc_sample_value_t sample = {0};
+				suunto_nautic_emit_time (s);
+				sample.event.type = mapped;
+				sample.event.flags = SAMPLE_FLAGS_BEGIN;
+				sample.event.value = (id << 8) | data[2];
+				if (s->callback) s->callback (DC_SAMPLE_EVENT, &sample, s->userdata);
+			}
+		}
+	} else if (id == CHUNK_OOAM) {
+		if (size < 3) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// [timeDelta:2][Type:1], the reason a dive ended, without an Active
+		// byte. The value is the same as for the other events.
+		unsigned int mapped = suunto_nautic_map_event (id, data[2]);
+		if (mapped != SAMPLE_EVENT_NONE) {
+			dc_sample_value_t sample = {0};
+			suunto_nautic_emit_time (s);
+			sample.event.type = mapped;
+			sample.event.flags = SAMPLE_FLAGS_BEGIN;
+			sample.event.value = (id << 8) | data[2];
+			if (s->callback) s->callback (DC_SAMPLE_EVENT, &sample, s->userdata);
+		}
+	} else if (id == CHUNK_GAS_SWITCH) {
+		if (size < 4) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// [timeDelta:2][gasnumber:int16 LE] -- 0-based, and equal to the
+		// cylinder slot / gas-mix index.
+		unsigned int gasnum = array_uint16_le (data + 2);
+		if (gasnum >= parser->ngasmixes) {
+			ERROR (context, "Invalid gas mix index (%u).", gasnum);
+			return DC_STATUS_DATAFORMAT;
+		}
+		dc_sample_value_t sample = {0};
+		suunto_nautic_emit_time (s);
+		sample.gasmix = gasnum;
+		if (s->callback) s->callback (DC_SAMPLE_GASMIX, &sample, s->userdata);
+	} else if (id == CHUNK_HEARTRATE) {
+		if (size < 3) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// [timeDelta:2][hr:uint8 bpm], only on the Ocean.
+		unsigned int hr = data[2];
+		if (hr) {
+			dc_sample_value_t sample = {0};
+			suunto_nautic_emit_time (s);
+			sample.heartbeat = hr;
+			if (s->callback) s->callback (DC_SAMPLE_HEARTBEAT, &sample, s->userdata);
+		}
+	} else if (id == CHUNK_BATTERY) {
+		if (size < 7) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// The current at 2, an int16, is left out: its scale is unknown.
+		unsigned int voltage_mv = array_uint16_le (data + 4);
+		unsigned int charge_permille = data[6] * 10; // % -> permille
+		unsigned char rec[5];
+		rec[0] = VENDOR_KIND_BATTERY;
+		rec[1] = voltage_mv & 0xFF;
+		rec[2] = (voltage_mv >> 8) & 0xFF;
+		rec[3] = charge_permille & 0xFF;
+		rec[4] = (charge_permille >> 8) & 0xFF;
+		suunto_nautic_emit_vendor (s, rec, sizeof (rec));
+	} else if (id == CHUNK_GPS_ACCURACY) {
+		if (size < 4) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// The EHPE and EVPE are int8 deltas, summed into metres.
+		s->ehpe += (signed char) data[2];
+		s->evpe += (signed char) data[3];
+		if (s->ehpe < 0) s->ehpe = 0;
+		if (s->evpe < 0) s->evpe = 0;
+		unsigned int e = (unsigned int) s->ehpe, v = (unsigned int) s->evpe;
+		unsigned char rec[5];
+		rec[0] = VENDOR_KIND_GPS_ACCURACY;
+		rec[1] = e & 0xFF; rec[2] = (e >> 8) & 0xFF;
+		rec[3] = v & 0xFF; rec[4] = (v >> 8) & 0xFF;
+		suunto_nautic_emit_vendor (s, rec, sizeof (rec));
+	} else if (id == layout->imu) {
+		if (size != IMU_SIZE) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// The accelerometer, gyroscope and magnetometer X, Y, Z, 9x int16
+		// at offset 6, passed on as they are.
+		unsigned char rec[1 + 18];
+		rec[0] = VENDOR_KIND_IMU;
+		memcpy (rec + 1, data + 6, 18);
+		suunto_nautic_emit_vendor (s, rec, sizeof (rec));
+	} else if (id == layout->features) {
+		if (size != FEATURES_SIZE) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// Dive route features: 5x uint16 at offset 6 -> DC_SAMPLE_VENDOR
+		// kind 4. These are inputs to the dive route tracking of the app,
+		// not the route itself, and their meaning is unknown.
+		unsigned char rec[1 + 10];
+		rec[0] = VENDOR_KIND_DIVEROUTE_FEATURES;
+		memcpy (rec + 1, data + 6, 10);
+		suunto_nautic_emit_vendor (s, rec, sizeof (rec));
+	} else if (id == CHUNK_SURFACE_PRESSURE) {
+		if (size < 6) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// The surface pressure and its maximum and minimum, as float32 in
+		// Pa, after the time delta. The last surface pressure is used.
+		parser->have_atmospheric = 1;
+		parser->atmospheric = array_float_le (data + 2);
+	} else if (id == CHUNK_ACTIVITY) {
+		if (size < 3) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// [timeDelta:2][sportId:1][customModeId: ascii]. The sport id
+		// is the app's ActivityType; 61/62 are the apnea sports, every
+		// other diving id is open circuit.
+		parser->sport = data[2];
+		parser->have_sport = 1;
+	}
+
+	return DC_STATUS_SUCCESS;
+}
+
+static dc_status_t
+suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	suunto_nautic_parser_t *parser = (suunto_nautic_parser_t *) abstract;
+
+	// The dive is SUMMARY_SIZE(4) SUMMARY PROFILE, see the driver: the
+	// /Summary section (gradient factors, gas mixes) and the profile (/Data).
+	if (abstract->size < 4) {
+		ERROR (abstract->context, "Unexpected dive size (%u).", abstract->size);
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	unsigned int summary_size = array_uint32_le (abstract->data);
+	if (summary_size > abstract->size - 4) {
+		ERROR (abstract->context, "Unexpected summary size (%u %u).", summary_size, abstract->size);
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	const unsigned char *summary = abstract->data + 4;
+	const unsigned char *profile = abstract->data + 4 + summary_size;
+	unsigned int profile_size = abstract->size - 4 - summary_size;
+
+	parser->cached = 0;
+	parser->layout = NULL;
+	parser->divetime = 0;
+	parser->maxdepth = 0.0;
+	parser->depth_sum = 0.0;
+	parser->depth_count = 0;
+	parser->have_temperature = 0;
+	parser->temperature_surface = 0;
+	parser->temperature_minimum = 0;
+	parser->temperature_maximum = 0;
+	parser->ntanks = 0;
+	memset (parser->tank, 0, sizeof (parser->tank));
+	parser->have_location = 0;
+	parser->latitude = 0;
+	parser->longitude = 0;
+	parser->have_atmospheric = 0;
+	parser->atmospheric = 0.0;
+	parser->have_datetime = 0;
+	parser->datetime = 0;
+	parser->timezone = 0;
+	parser->have_sport = 0;
+	parser->sport = 0;
+	parser->ngasmixes = 0;
+	memset (parser->gasmix, 0, sizeof (parser->gasmix));
+	parser->have_gf = 0;
+	parser->gf_low = 0;
+	parser->gf_high = 0;
+	parser->have_ppo2max = 0;
+	parser->ppo2max = 0.0;
+	parser->have_watertype = 0;
+	parser->watertype = 0;
+
+	suunto_nautic_summary_t summary_state;
+	memset (&summary_state, 0, sizeof (summary_state));
+	summary_state.parser = parser;
+
+	status = suunto_nautic_sbem_parse (abstract->context, summary, summary_size, suunto_nautic_parser_summary, &summary_state);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	if (summary_state.nchunks == 0) {
+		ERROR (abstract->context, "Unexpected summary without a dive header.");
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	suunto_nautic_profile_t s;
+	memset (&s, 0, sizeof (s));
+	s.parser = parser;
+	s.callback = callback;
+	s.userdata = userdata;
+	s.emitted_ms = -1;
+	s.dive_state = DIVE_STATE_IDLING;
+	s.diving_start_ms = -1;
+	for (unsigned int i = 0; i < MAX_TANKS * 2; i++)
+		s.tankmap[i] = -1;
+	for (unsigned int i = 0; i < MAX_TANKS; i++)
+		s.p2_first[i] = -1;
+
+	status = suunto_nautic_sbem_parse (abstract->context, profile, profile_size, suunto_nautic_parser_profile, &s);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	// A dive still in progress at the end of the stream closes the final span.
+	if (s.dive_state == DIVE_STATE_DIVING && s.diving_start_ms >= 0)
+		s.total_dive_ms += s.time_ms - s.diving_start_ms;
+
+	// Dive time = total time in the Diving state. Fall back to the full
+	// elapsed time if no DiveState markers were seen.
+	if (s.total_dive_ms > 0)
+		parser->divetime = s.total_dive_ms;
+	else
+		parser->divetime = s.time_ms;
+
+	if (parser->divetime < 0 || parser->divetime > UINT_MAX) {
+		ERROR (abstract->context, "Unexpected dive time.");
+		return DC_STATUS_DATAFORMAT;
+	}
+
+	parser->cached = 1;
+
+	return DC_STATUS_SUCCESS;
+}
 
 dc_status_t
 suunto_nautic_parser_create (dc_parser_t **out, dc_context_t *context, const unsigned char data[], size_t size)
@@ -248,818 +950,6 @@ suunto_nautic_parser_create (dc_parser_t **out, dc_context_t *context, const uns
 	return DC_STATUS_SUCCESS;
 }
 
-// Chunk IDs whose payload length is fixed and has been confirmed
-// against real captured data. Heatshrink decompression can leave
-// localized artifacts in the stream (e.g. runs of a single repeated
-// byte), which a strict linear TLV walk would otherwise misread as a
-// chunk header -- permanently desyncing every chunk after it. Any
-// candidate header naming one of these IDs is only accepted if its
-// length byte matches; otherwise it is a "ghost chunk" and the parser
-// resynchronizes by scanning forward one byte at a time.
-static int
-suunto_nautic_sbem_fixed_length (unsigned int id)
-{
-	switch (id) {
-	case CHUNK_ACTIVITY:         return 6;
-	case CHUNK_GPS:              return 20;
-	case CHUNK_GPS_ACCURACY:     return 6;
-	case CHUNK_BATTERY:          return 7;
-	case CHUNK_SURFACE_PRESSURE: return 14;
-	default:                     return -1; // unknown or variable length
-	}
-}
-
-// Advance to the next TLV chunk starting at *offset. Returns 0 (and
-// leaves *offset unchanged) once the buffer is exhausted.
-static int
-suunto_nautic_sbem_next (const unsigned char data[], unsigned int size, unsigned int *offset, sbem_chunk_t *chunk)
-{
-	unsigned int pos = *offset;
-
-	while (pos + 2 <= size) {
-		unsigned int id = data[pos];
-		unsigned int length = data[pos + 1];
-		unsigned int header = 2;
-
-		if (length == 255) {
-			if (pos + 6 > size) {
-				pos++;
-				continue;
-			}
-			length = array_uint32_le (data + pos + 2);
-			header = 6;
-		}
-
-		int fixed = suunto_nautic_sbem_fixed_length (id);
-		if (fixed >= 0 && (unsigned int) fixed != length) {
-			// Ghost chunk: a real chunk with this id never has
-			// this length. Resynchronize.
-			pos++;
-			continue;
-		}
-
-		if (pos + header + length > size) {
-			pos++;
-			continue;
-		}
-
-		chunk->id = id;
-		chunk->data = data + pos + header;
-		chunk->size = length;
-
-		*offset = pos + header + length;
-
-		return 1;
-	}
-
-	return 0;
-}
-
-// The driver appends the (uncompressed) /Summary SBEM after the profile,
-// so the combined buffer holds two "SBEM0103" sections. Return the offset
-// of the second one (the /Summary), or `size` when there's only the
-// profile. Bounds the profile chunk walk and locates the /Summary fields.
-static size_t
-suunto_nautic_find_summary (const unsigned char *data, size_t size)
-{
-	if (size < SBEM_MAGIC_SIZE)
-		return size;
-	for (size_t i = SBEM_MAGIC_SIZE; i + SBEM_MAGIC_SIZE <= size; i++) {
-		if (memcmp (data + i, "SBEM0103", SBEM_MAGIC_SIZE) == 0)
-			return i;
-	}
-	return size;
-}
-
-// The /Summary's records are plain [id][len] TLVs (the profile's fixed-length
-// table doesn't apply), ending in trailing bytes that don't form a whole
-// record. Record ids differ between models, so records are found by position.
-static const unsigned char *
-suunto_nautic_summary_record (const unsigned char *sbem, size_t size, unsigned int index, size_t *out_length)
-{
-	size_t pos = SBEM_MAGIC_SIZE;
-	for (unsigned int i = 0; pos + 2 <= size; i++) {
-		size_t length = sbem[pos + 1];
-		size_t header = 2;
-		if (length == 255) {
-			if (pos + 6 > size)
-				break;
-			length = array_uint32_le (sbem + pos + 2);
-			header = 6;
-		}
-		if (length > size - pos - header)
-			break;
-		if (i == index) {
-			*out_length = length;
-			return sbem + pos + header;
-		}
-		pos += header + length;
-	}
-	return NULL;
-}
-
-// Lowest minimum and highest maximum water temperature across the Windows records (K).
-static int
-suunto_nautic_summary_window_temperatures (const unsigned char *sbem, size_t size, double *tmin, double *tmax)
-{
-	int found = 0;
-	for (unsigned int i = 0; i < SUMMARY_WINDOW_COUNT; i++) {
-		size_t length = 0;
-		const unsigned char *window = suunto_nautic_summary_record (sbem, size, SUMMARY_WINDOW_FIRST + i, &length);
-		if (window == NULL || length < SUMMARY_WINDOW_TEMP_MAX + 4)
-			continue;
-		double lo = array_float_le (window + SUMMARY_WINDOW_TEMP_MIN);
-		double hi = array_float_le (window + SUMMARY_WINDOW_TEMP_MAX);
-		if (!(lo > 250.0 && hi < 330.0 && lo <= hi))
-			continue;
-		if (!found || lo < *tmin)
-			*tmin = lo;
-		if (!found || hi > *tmax)
-			*tmax = hi;
-		found = 1;
-	}
-	return found;
-}
-
-// The /Summary's dive record: the last record long enough to hold its fields.
-static const unsigned char *
-suunto_nautic_summary_dive_record (const unsigned char *sbem, size_t size)
-{
-	const unsigned char *record = NULL;
-	size_t pos = SBEM_MAGIC_SIZE;
-	while (pos + 2 <= size) {
-		size_t length = sbem[pos + 1];
-		size_t header = 2;
-		if (length == 255) {
-			if (pos + 6 > size)
-				break;
-			length = array_uint32_le (sbem + pos + 2);
-			header = 6;
-		}
-		if (length > size - pos - header)
-			break;
-		if (length >= SUMMARY_DIVE_AVGDEPTH + 4)
-			record = sbem + pos + header;
-		pos += header + length;
-	}
-	return record;
-}
-
-// Parse gradient factors and gas mixes from the /Summary section, whose
-// "SBEM0103" signature is at `sbem` (length `size`). Offsets are relative
-// to that signature (confirmed on real hardware). Gases are validated by
-// plausibility (O2 in 1..100, He in 0..100-O2) and counted until the first
-// implausible slot, since unused slots hold unrelated bytes.
-static void
-suunto_nautic_parse_summary (suunto_nautic_parser_t *parser, const unsigned char *sbem, size_t size)
-{
-	if (size >= SUMMARY_GF_LOW + 2) { // GF_LOW (0x35) is the higher of the two offsets
-		unsigned int low = array_uint16_le (sbem + SUMMARY_GF_LOW);
-		unsigned int high = array_uint16_le (sbem + SUMMARY_GF_HIGH);
-		parser->decomodel.type = DC_DECOMODEL_BUHLMANN;
-		parser->decomodel.conservatism = 0;
-		parser->decomodel.params.gf.low = low;
-		parser->decomodel.params.gf.high = high;
-		parser->have_decomodel = 1;
-	}
-
-	if (size > SUMMARY_WATER_TYPE) {
-		unsigned int type = sbem[SUMMARY_WATER_TYPE];
-		if (type <= 2) {
-			static const double density[] = {1000.0, 1020.0, 1030.0};
-			parser->salinity.type = type ? DC_WATER_SALT : DC_WATER_FRESH;
-			parser->salinity.density = density[type];
-			parser->have_salinity = 1;
-		}
-	}
-
-	for (unsigned int i = 0; i < MAX_GASMIXES; i++) {
-		size_t base = SUMMARY_GAS_BASE + (size_t) i * SUMMARY_GAS_STRIDE;
-		if (base + SUMMARY_GAS_HE + 2 > size)
-			break;
-		int o2 = (int16_t) array_uint16_le (sbem + base + SUMMARY_GAS_O2);
-		int he = (int16_t) array_uint16_le (sbem + base + SUMMARY_GAS_HE);
-		if (o2 < 1 || o2 > 100 || he < 0 || he > 100 || o2 + he > 100)
-			break; // unused/implausible slot -- stop
-		unsigned int g = parser->ngasmixes;
-		parser->gasmix[g].oxygen = o2 / 100.0;
-		parser->gasmix[g].helium = he / 100.0;
-		parser->gasmix[g].nitrogen = 1.0 - (o2 + he) / 100.0;
-		parser->gasmix[g].usage = DC_USAGE_NONE;
-		// Per-gas cylinder water capacity (float32 m^3) -> litres, when the
-		// record's volume field is present and physically sane.
-		if (base + SUMMARY_GAS_VOLUME + 4 <= size) {
-			double vol_m3 = array_float_le (sbem + base + SUMMARY_GAS_VOLUME);
-			if (vol_m3 > 0.0 && vol_m3 < 1.0)
-				parser->gasvolume[g] = vol_m3 * 1000.0;
-		}
-		parser->ngasmixes++;
-	}
-}
-
-// Map a Suunto dive-event (subgroup = chunk id, plus the subgroup's Type
-// enum) to the closest libdivecomputer sample-event type. Suunto's set is
-// richer than dc_sample_event_t, so unmapped subtypes fall back to a
-// generic marker; the raw subgroup+type is still available via the
-// descriptor for anyone needing the exact Suunto label.
-static unsigned int
-suunto_nautic_map_event (unsigned int chunk_id, unsigned int type)
-{
-	switch (chunk_id) {
-	case CHUNK_EVENT_ALARM:
-		switch (type) {
-		case 1: case 2: return SAMPLE_EVENT_PO2;                 // PO2 Low/High
-		case 3:         return SAMPLE_EVENT_AIRTIME;             // Tank Pressure
-		case 5:         return SAMPLE_EVENT_ASCENT;              // Ascent Speed
-		case 10:        return SAMPLE_EVENT_CEILING;             // Deco Stop Broken
-		case 12:        return SAMPLE_EVENT_DEEPSTOP;            // Deep Stop Broken
-		case 13:        return SAMPLE_EVENT_SAFETYSTOP_MANDATORY;// Safety Stop Broken
-		default:        return SAMPLE_EVENT_VIOLATION;
-		}
-	case CHUNK_EVENT_WARNING:
-		switch (type) {
-		case 28:        return SAMPLE_EVENT_AIRTIME;             // User Tank Pressure
-		default:        return SAMPLE_EVENT_VIOLATION;
-		}
-	case CHUNK_EVENT_STATE:
-		switch (type) {
-		case 19:          return SAMPLE_EVENT_CEILING;           // Ndl exceeded
-		case 35: case 38: return SAMPLE_EVENT_DECOSTOP;          // At/Ahead Deco Stop
-		case 36: case 39: return SAMPLE_EVENT_DEEPSTOP;          // At/Ahead Deep Stop
-		case 37: case 40: return SAMPLE_EVENT_SAFETYSTOP;        // At/Ahead Safety Stop
-		default:          return SAMPLE_EVENT_BOOKMARK;
-		}
-	case CHUNK_EVENT_NOTIFY:
-		switch (type) {
-		case 11:        return SAMPLE_EVENT_GASCHANGE;           // Gas Switch
-		default:        return SAMPLE_EVENT_BOOKMARK;
-		}
-	default:
-		return SAMPLE_EVENT_BOOKMARK;
-	}
-}
-
-// Emit a Suunto-Nautic vendor record at the given sample time. Every such
-// record starts with a VENDOR_KIND_* byte so a single vendor type can carry
-// several kinds of non-standard telemetry (battery, GPS accuracy, IMU, ...).
-static void
-suunto_nautic_emit_vendor (dc_sample_callback_t callback, void *userdata,
-	int time_ms, const unsigned char *rec, unsigned int size)
-{
-	dc_sample_value_t sample = {0};
-	sample.time = (unsigned int) time_ms;
-	callback (DC_SAMPLE_TIME, &sample, userdata);
-	sample.vendor.type = SAMPLE_VENDOR_SUUNTO_NAUTIC;
-	sample.vendor.size = size;
-	sample.vendor.data = rec;
-	callback (DC_SAMPLE_VENDOR, &sample, userdata);
-}
-
-static dc_status_t
-suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata)
-{
-	suunto_nautic_parser_t *parser = (suunto_nautic_parser_t *) abstract;
-
-	if (abstract->size < SBEM_MAGIC_SIZE || memcmp (abstract->data, "SBEM0103", SBEM_MAGIC_SIZE) != 0) {
-		ERROR (abstract->context, "Unexpected magic in the SBEM stream.");
-		return DC_STATUS_DATAFORMAT;
-	}
-
-	// The profile (/Data) is the first SBEM section; an optional /Summary
-	// section (gradient factors, gas mix) is appended after it. Walk only
-	// the profile here; parse /Summary separately below.
-	size_t profile_size = suunto_nautic_find_summary (abstract->data, abstract->size);
-
-	unsigned int offset = SBEM_MAGIC_SIZE;
-	// Time is delta-encoded: every chunk (except the timeline base 0x01)
-	// begins with a signed int16 LE millisecond delta at payload[0:2]. The
-	// running sum is the absolute sample time -- there is no per-sample
-	// absolute timestamp and no fixed sample rate.
-	int time_ms = 0;
-
-	// Dive phase, from CHUNK_DIVE_STATE. Dive time is the TOTAL time spent in
-	// the Diving state (sum of every Diving span), which matches the app's
-	// DiveTimeMax on multi-level dives that briefly surface mid-dive -- taking
-	// only the longest single span undercounts those. A spurious ~0 s startup
-	// blip contributes nothing. Average depth is taken over Diving samples only;
-	// counting from the first raw sample would include the pre-dive/surface
-	// phase and skew both low.
-	unsigned int dive_state = DIVE_STATE_IDLING;
-	int diving_start_ms = -1;
-	int total_dive_ms = 0;
-
-	double maxdepth = 0.0;
-	double depth_sum = 0.0;
-	unsigned int depth_count = 0;
-
-	unsigned int have_temperature = 0;
-	double temperature_surface = 0.0;
-	double temperature_minimum = 0.0;
-	double temperature_maximum = 0.0;
-
-	unsigned int ntanks = 0;
-	suunto_nautic_tank_t tank[MAX_TANKS];
-	memset (tank, 0, sizeof (tank));
-	// Each cylinder slot has two pressure fields: Pressure (+2, the main
-	// transmitter) and Pressure2 (+6, a sidemount second transmitter). Map
-	// each (slot, field) with data to a compacted tank index. Pressure2 is
-	// gated: a real second transmitter produces a continuous non-zero
-	// curve, whereas a slot with no second transmitter emits a single
-	// spurious Pressure2 sample then zeros -- so only accept Pressure2 once
-	// it has read non-zero at least twice (p2_first holds the first value).
-	int tankmap[MAX_TANKS * 2];
-	int p2_first[MAX_TANKS];
-	// The last reading of each tank while Diving: readings taken on the surface
-	// after the dive can be of a closed, purged regulator (~1 bar).
-	double diving_end[MAX_TANKS];
-	for (unsigned int ti = 0; ti < MAX_TANKS * 2; ti++)
-		tankmap[ti] = -1;
-	for (unsigned int ti = 0; ti < MAX_TANKS; ti++) {
-		p2_first[ti] = -1;
-		diving_end[ti] = -1.0;
-	}
-
-	unsigned int have_location = 0;
-	dc_location_t location = {0};
-
-	unsigned int have_atmospheric = 0;
-	double atmospheric = 0.0;
-
-	unsigned int have_datetime = 0;
-
-	// Open circuit unless a CHUNK_ACTIVITY sport id says the dive was apnea.
-	// The Nautic/Ocean are recreational OC computers (no CCR/SCR), and with no
-	// activity chunk at all OC is the right default -- far better than the
-	// dc_divemode_t zero value (freedive) a missing field leaves behind.
-	dc_divemode_t divemode = DC_DIVEMODE_OC;
-
-	// GPS horizontal/vertical position error, int8-delta-accumulated (chunk 0x0E).
-	int ehpe = 0, evpe = 0;
-
-	sbem_chunk_t chunk;
-	while (suunto_nautic_sbem_next (abstract->data, (unsigned int) profile_size, &offset, &chunk)) {
-		// Advance the clock by this chunk's leading ms delta (all groups
-		// except the timeline base carry one).
-		if (chunk.id != CHUNK_TIMELINE_BASE && chunk.size >= 2)
-			time_ms += (int16_t) array_uint16_le (chunk.data);
-
-		if (chunk.id == CHUNK_PROFILE_1HZ && chunk.size >= 18) {
-			double temperature = array_uint16_le (chunk.data + 16) / 100.0 - 273.15;
-
-			if (!have_temperature) {
-				// The first reading is taken at/near the surface at dive start.
-				temperature_surface = temperature;
-				temperature_minimum = temperature_maximum = temperature;
-				have_temperature = 1;
-			} else {
-				if (temperature < temperature_minimum)
-					temperature_minimum = temperature;
-				if (temperature > temperature_maximum)
-					temperature_maximum = temperature;
-			}
-
-			if (callback) {
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				sample.temperature = temperature;
-				callback (DC_SAMPLE_TEMPERATURE, &sample, userdata);
-			}
-		} else if (chunk.id == CHUNK_EXTENDED_STATUS) {
-			if (chunk.size >= 6) {
-				double depth = array_float_le (chunk.data + 2);
-
-				if (depth > maxdepth)
-					maxdepth = depth;
-				// Average only over the Diving phase (matches the app).
-				if (dive_state == DIVE_STATE_DIVING) {
-					depth_sum += depth;
-					depth_count++;
-				}
-
-				if (callback) {
-					dc_sample_value_t sample = {0};
-					sample.time = (unsigned int) time_ms;
-					callback (DC_SAMPLE_TIME, &sample, userdata);
-					sample.depth = depth;
-					callback (DC_SAMPLE_DEPTH, &sample, userdata);
-				}
-			}
-
-			// Cylinders array: up to 8 elements of 18 bytes, starting at
-			// offset 42 (idx:1, ?:1, pressure:4 LE Pa, pressure2:4 LE Pa, ...).
-			// Read each tank only if its record fits: the shorter Nautic S
-			// extended-status (141 B) holds fewer tank slots than the 195 B
-			// Ocean/Nautic one, but tank 0's pressure is at the same offset 44
-			// on both. Requiring the full 8-slot array (186 B) would drop all
-			// tank pressure on the shorter Nautic S chunk.
-			{
-				// Read every cylinder slot whose FULL 18-byte record fits in
-				// this chunk: the 195 B chunk holds all 8, the shorter 141 B
-				// chunk (Nautic S and some Ocean firmware) holds slots 0-4.
-				// Requiring the whole record (base + 18) rather than just the
-				// pressure field excludes the partial slot past the end, whose
-				// bytes would otherwise occasionally look like a phantom tank.
-				// Each real record starts with its own index byte, so stop at
-				// the first slot whose leading byte isn't its index. Slots 0-4
-				// carry idx 0-4 on the 141 B chunk; tank 0 pressure is at offset
-				// 44 on both layouts.
-				for (unsigned int i = 0; i < MAX_TANKS; i++) {
-					unsigned int base = 42 + i * 18;
-					if (base + 18 > chunk.size)
-						break; // full tank record doesn't fit this chunk
-					if (chunk.data[base] != i)
-						break; // not a real tank slot
-
-					// Gas time remaining: uint32 LE seconds at record +10, for
-					// the primary cylinder. 0xFFFFFFFF means not computed (no
-					// AI, or not enough data yet). This is the app's
-					// Cylinders[].GasTime; exposed as RBT minutes, the same way
-					// suunto_eonsteel does.
-					if (i == 0 && callback) {
-						unsigned int gastime = array_uint32_le (chunk.data + base + 10);
-						if (gastime != 0xFFFFFFFF && gastime != 0) {
-							dc_sample_value_t sample = {0};
-							sample.time = (unsigned int) time_ms;
-							callback (DC_SAMPLE_TIME, &sample, userdata);
-							sample.rbt = gastime / 60;
-							callback (DC_SAMPLE_RBT, &sample, userdata);
-						}
-					}
-
-					for (unsigned int field = 0; field < 2; field++) {
-						unsigned int pressure_pa = array_uint32_le (chunk.data + base + 2 + field * 4);
-						if (pressure_pa == 0)
-							continue;
-						unsigned int key = i * 2 + field;
-						if (field == 1 && tankmap[key] < 0) {
-							// Defer creating a Pressure2 tank until its second non-zero
-							// reading, so a lone spurious sample doesn't become a phantom.
-							if (p2_first[i] < 0) {
-								p2_first[i] = (int) pressure_pa;
-								continue;
-							}
-						}
-						double bar = pressure_pa / 100000.0;
-						if (tankmap[key] < 0) {
-							if (ntanks >= MAX_TANKS)
-								continue;
-							tankmap[key] = (int) ntanks;
-							tank[ntanks].used = 1;
-							// Cylinder slot index == GasNumber, so this tank
-							// breathes gas i (linked to gasmix[i] below).
-							tank[ntanks].gasmix = i;
-							tank[ntanks].field = field;
-							// Seed begin from the first observed reading (the deferred
-							// one for Pressure2); refined to the max below.
-							tank[ntanks].beginpressure = (field == 1 && p2_first[i] >= 0)
-								? p2_first[i] / 100000.0 : bar;
-							ntanks++;
-						}
-						unsigned int t = (unsigned int) tankmap[key];
-						tank[t].endpressure = bar;
-						if (dive_state == DIVE_STATE_DIVING)
-							diving_end[t] = bar;
-						// Begin pressure = the highest reading seen: a cylinder only
-						// loses pressure during a dive, so the max is the true start.
-						// This ignores an initial dropout where a transmitter that
-						// hasn't paired yet reports a spurious low value (e.g. ~9 bar
-						// for the first minutes, then jumps to the real ~200 bar --
-						// nandodiver's dual-transmitter dives, issue #29/#34).
-						if (bar > tank[t].beginpressure)
-							tank[t].beginpressure = bar;
-						if (callback) {
-							dc_sample_value_t sample = {0};
-							sample.time = (unsigned int) time_ms;
-							callback (DC_SAMPLE_TIME, &sample, userdata);
-							sample.pressure.tank = t;
-							sample.pressure.value = bar;
-							callback (DC_SAMPLE_PRESSURE, &sample, userdata);
-						}
-					}
-				}
-			}
-
-			// Deco/safety fields. Offsets validated 244/244 against the app's
-			// export: TTS uint16 @22 (s), NDL int16 @30 (s), Ceiling float32 @38
-			// (m). Ceiling/NDL/TTS use the standard DC_SAMPLE_DECO channel.
-			if (callback && chunk.size >= 42) {
-				unsigned int tts = array_uint16_le (chunk.data + 22);
-				int ndl = (int16_t) array_uint16_le (chunk.data + 30);
-				double ceiling = array_float_le (chunk.data + 38);
-
-				dc_sample_value_t t = {0};
-				t.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &t, userdata);
-
-				dc_sample_value_t deco = {0};
-				if (ceiling > 0.0) {
-					deco.deco.type = DC_DECO_DECOSTOP;
-					deco.deco.depth = ceiling;
-					deco.deco.tts = tts;
-				} else {
-					deco.deco.type = DC_DECO_NDL;
-					deco.deco.time = ndl > 0 ? (unsigned int) ndl : 0;
-					deco.deco.tts = tts;
-				}
-				callback (DC_SAMPLE_DECO, &deco, userdata);
-			}
-
-			// Real-time gradient factors -> vendor kind 5 (no standard channel).
-			// gf99 @186 and surface @190 sit past the cylinder array; the
-			// leading-tissue GF @78 is inside that span, so it's only reliable
-			// while the upper tank slots are unused (as on this reference dive).
-			if (callback && chunk.size >= 192) {
-				int gf99    = (int16_t) array_uint16_le (chunk.data + 186);
-				int gf_surf = (int16_t) array_uint16_le (chunk.data + 190);
-				int gf_lead = (int16_t) array_uint16_le (chunk.data + 78);
-				unsigned char rec[7];
-				rec[0] = VENDOR_KIND_GF;
-				rec[1] = gf99 & 0xFF;    rec[2] = (gf99 >> 8) & 0xFF;
-				rec[3] = gf_surf & 0xFF; rec[4] = (gf_surf >> 8) & 0xFF;
-				rec[5] = gf_lead & 0xFF; rec[6] = (gf_lead >> 8) & 0xFF;
-				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
-			}
-		} else if (chunk.id == CHUNK_GPS && chunk.size >= 18) {
-			// Payload: [timeDelta:2][UTC:8 ms LE][lat:4][lon:4]. UTC is an
-			// absolute UNIX time in milliseconds; subtracting this sample's
-			// relative time (time_ms) yields the stream-start epoch, i.e. the
-			// dive start (== the logbook id, confirmed to the second). This is
-			// the only absolute clock in the stream, so the first GPS fix sets
-			// the dive datetime.
-			unsigned long long utc_ms = array_uint64_le (chunk.data + 2);
-			int lat_raw = (int) array_uint32_le (chunk.data + 10);
-			int lon_raw = (int) array_uint32_le (chunk.data + 14);
-
-			if (!have_datetime && utc_ms > (unsigned long long) time_ms) {
-				have_datetime = 1;
-				parser->datetime = (dc_ticks_t) ((utc_ms - (unsigned long long) time_ms) / 1000);
-			}
-
-			if (!have_location) {
-				have_location = 1;
-				location.latitude = lat_raw / 1.0e7;
-				location.longitude = lon_raw / 1.0e7;
-				location.altitude = 0.0;
-			}
-
-			if (callback) {
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				sample.location.latitude = lat_raw / 1.0e7;
-				sample.location.longitude = lon_raw / 1.0e7;
-				sample.location.altitude = 0.0;
-				callback (DC_SAMPLE_LOCATION, &sample, userdata);
-			}
-		} else if (chunk.id == CHUNK_DIVE_STATE && chunk.size >= 3) {
-			unsigned int new_state = chunk.data[2];
-			if (new_state == DIVE_STATE_DIVING && dive_state != DIVE_STATE_DIVING) {
-				diving_start_ms = time_ms;
-			} else if (new_state != DIVE_STATE_DIVING && dive_state == DIVE_STATE_DIVING) {
-				if (diving_start_ms >= 0)
-					total_dive_ms += time_ms - diving_start_ms;
-				diving_start_ms = -1;
-			}
-			dive_state = new_state;
-		} else if ((chunk.id == CHUNK_EVENT_ALARM || chunk.id == CHUNK_EVENT_WARNING ||
-				chunk.id == CHUNK_EVENT_NOTIFY || chunk.id == CHUNK_EVENT_STATE) && chunk.size >= 4) {
-			// [timeDelta:2][Type:1][Active:1]; Active 1=begin, 0=end.
-			// The libdivecomputer event vocabulary can't express Suunto's full
-			// set (e.g. "Safety Stop Ahead" vs "At Safety Stop" both map to
-			// SAFETYSTOP), so alongside the mapped type we pass the native
-			// (subgroup, type) through event.value as (chunk_id << 8 | type).
-			// Consumers that want the exact Suunto label decode it from there;
-			// standard consumers use event.type as usual. (Gas switch keeps
-			// event.value as the gas number, per libdivecomputer convention.)
-			if (callback) {
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				sample.event.type = suunto_nautic_map_event (chunk.id, chunk.data[2]);
-				sample.event.flags = chunk.data[3] ? SAMPLE_FLAGS_BEGIN : SAMPLE_FLAGS_END;
-				sample.event.value = (chunk.id << 8) | chunk.data[2];
-				callback (DC_SAMPLE_EVENT, &sample, userdata);
-			}
-		} else if (chunk.id == CHUNK_OOAM && chunk.size >= 3) {
-			// [timeDelta:2][Type:1]; one-shot dive-end reason (Ooam.Type: Out of
-			// battery / Ceiling broken / SW crash / Max depth / Algorithm changed
-			// / Gauge dive). No Active byte. Emitted as a begin-edge event; the
-			// native (subgroup, type) is passed in event.value = (chunk_id<<8|type)
-			// for the precise Suunto label, same convention as the other events.
-			if (callback) {
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				sample.event.type = suunto_nautic_map_event (chunk.id, chunk.data[2]);
-				sample.event.flags = SAMPLE_FLAGS_BEGIN;
-				sample.event.value = (chunk.id << 8) | chunk.data[2];
-				callback (DC_SAMPLE_EVENT, &sample, userdata);
-			}
-		} else if (chunk.id == CHUNK_GAS_SWITCH && chunk.size >= 4) {
-			// [timeDelta:2][gasnumber:int16 LE] -- 0-based, and equal to the
-			// cylinder slot / gas-mix index.
-			int gasnum = (int16_t) array_uint16_le (chunk.data + 2);
-			if (gasnum >= 0 && callback) {
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				// Modern channel: the active gas-mix index.
-				sample.gasmix = (unsigned int) gasnum;
-				callback (DC_SAMPLE_GASMIX, &sample, userdata);
-				// Legacy channel, for consumers that only read events.
-				sample.event.type = SAMPLE_EVENT_GASCHANGE;
-				sample.event.flags = SAMPLE_FLAGS_BEGIN;
-				sample.event.value = (unsigned int) gasnum;
-				callback (DC_SAMPLE_EVENT, &sample, userdata);
-			}
-		} else if (chunk.id == CHUNK_HEARTRATE && chunk.size >= 3) {
-			// [timeDelta:2][hr:uint8 bpm]. Optical wrist HR, present only on
-			// the Suunto Ocean (the Nautic / Nautic S have no HR sensor, so
-			// the chunk never appears there). Byte-exact against the app
-			// export's per-sample HR on a real Ocean dive (66-113 bpm).
-			unsigned int hr = chunk.data[2];
-			if (hr && callback) {
-				dc_sample_value_t sample = {0};
-				sample.time = (unsigned int) time_ms;
-				callback (DC_SAMPLE_TIME, &sample, userdata);
-				sample.heartbeat = hr;
-				callback (DC_SAMPLE_HEARTBEAT, &sample, userdata);
-			}
-		} else if (chunk.id == CHUNK_BATTERY && chunk.size >= 7) {
-			// Battery telemetry -> DC_SAMPLE_VENDOR kind 1.
-			// (Current at chunk.data+2 is int16 but its scale isn't confirmed,
-			// so it's left out for now.)
-			if (callback) {
-				unsigned int voltage_mv = array_uint16_le (chunk.data + 4);
-				unsigned int charge_permille = chunk.data[6] * 10; // % -> permille
-				unsigned char rec[5];
-				rec[0] = VENDOR_KIND_BATTERY;
-				rec[1] = voltage_mv & 0xFF;
-				rec[2] = (voltage_mv >> 8) & 0xFF;
-				rec[3] = charge_permille & 0xFF;
-				rec[4] = (charge_permille >> 8) & 0xFF;
-				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
-			}
-		} else if (chunk.id == CHUNK_GPS_ACCURACY && chunk.size >= 4) {
-			// EHPE/EVPE are int8 deltas accumulated from zero -> DC_SAMPLE_VENDOR
-			// kind 2, absolute metres.
-			ehpe += (int8_t) chunk.data[2];
-			evpe += (int8_t) chunk.data[3];
-			if (ehpe < 0) ehpe = 0;
-			if (evpe < 0) evpe = 0;
-			if (callback) {
-				unsigned int e = (unsigned int) ehpe, v = (unsigned int) evpe;
-				unsigned char rec[5];
-				rec[0] = VENDOR_KIND_GPS_ACCURACY;
-				rec[1] = e & 0xFF; rec[2] = (e >> 8) & 0xFF;
-				rec[3] = v & 0xFF; rec[4] = (v >> 8) & 0xFF;
-				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
-			}
-		} else if ((chunk.id == CHUNK_IMU || chunk.id == CHUNK_IMU_ALT) && chunk.size >= 24) {
-			// High-rate IMU: 9x int16 (accel/gyro/mag X,Y,Z) at offset 6, already
-			// little-endian -> DC_SAMPLE_VENDOR kind 3, passed through verbatim.
-			// Matched by shape (payload >= 24) across both id variants (0x23 on
-			// 195-byte watches, 0x22 on 141-byte ones) so IMU decodes on all
-			// firmware, not just the id-0x23 devices.
-			if (callback) {
-				unsigned char rec[1 + 18];
-				rec[0] = VENDOR_KIND_IMU;
-				memcpy (rec + 1, chunk.data + 6, 18);
-				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
-			}
-		} else if ((chunk.id == CHUNK_DIVEROUTE_FEATURES || chunk.id == CHUNK_IMU) &&
-				chunk.size >= 10 && chunk.size <= 16) {
-			// DiveRouteFeatures: 5x uint16 at offset 6 -> DC_SAMPLE_VENDOR kind 4.
-			// Id is 0x24 on 195-byte watches and 0x23 (small, payload 16) on
-			// 141-byte ones; the payload bound (<= 16) excludes the 141-byte
-			// 0x24 summary record so it is no longer misread as this channel.
-			// NOT the dive route (which the watch does not store); semantics TBD.
-			if (callback) {
-				unsigned char rec[1 + 10];
-				rec[0] = VENDOR_KIND_DIVEROUTE_FEATURES;
-				memcpy (rec + 1, chunk.data + 6, 10);
-				suunto_nautic_emit_vendor (callback, userdata, time_ms, rec, sizeof (rec));
-			}
-		} else if (chunk.id == CHUNK_SURFACE_PRESSURE && chunk.size >= 6) {
-			// 3 Float32 values at offset 2/6/10 (SurfacePressure,
-			// MaxSurfacePressure, MinSurfacePressure), Pa -- offset
-			// 2, not 0: like chunk 0x16's Depth field, there are 2
-			// leading bytes before the data starts. DC_FIELD_ATMOSPHERIC
-			// is a single ambient-pressure reading in bar, so only
-			// SurfacePressure (offset 2) is used; last one logged wins.
-			have_atmospheric = 1;
-			atmospheric = array_float_le (chunk.data + 2) / 100000.0;
-		} else if (chunk.id == CHUNK_ACTIVITY && chunk.size >= 3) {
-			// [timeDelta:2][sportId:1][customModeId: ascii]. The sport id
-			// is the app's ActivityType; 61/62 are the apnea sports, every
-			// other diving id is open circuit.
-			unsigned int sport = chunk.data[2];
-			if (sport == SPORT_ID_FREEDIVE || sport == SPORT_ID_MERMAIDING)
-				divemode = DC_DIVEMODE_FREEDIVE;
-			else
-				divemode = DC_DIVEMODE_OC;
-		}
-	}
-
-	// A dive still in progress at the end of the stream closes the final span.
-	if (dive_state == DIVE_STATE_DIVING && diving_start_ms >= 0)
-		total_dive_ms += time_ms - diving_start_ms;
-
-	// Dive time = total time in the Diving state (seconds). Fall back to the
-	// full elapsed time if no DiveState markers were seen.
-	// Truncated, as the app shows it: 4680.5 s is 78:00.
-	if (total_dive_ms > 0)
-		parser->divetime = (unsigned int) (total_dive_ms / 1000);
-	else
-		parser->divetime = time_ms > 0 ? (unsigned int) (time_ms / 1000) : 0;
-	parser->maxdepth = maxdepth;
-	parser->avgdepth = depth_count ? depth_sum / depth_count : 0.0;
-	parser->have_temperature = have_temperature;
-	parser->temperature_surface = temperature_surface;
-	parser->temperature_minimum = temperature_minimum;
-	parser->temperature_maximum = temperature_maximum;
-	for (unsigned int t = 0; t < ntanks; t++) {
-		if (diving_end[t] >= 0.0)
-			tank[t].endpressure = diving_end[t];
-	}
-	parser->ntanks = ntanks;
-	memcpy (parser->tank, tank, sizeof (tank));
-	parser->have_location = have_location;
-	parser->location = location;
-	parser->have_atmospheric = have_atmospheric;
-	parser->atmospheric = atmospheric;
-	parser->have_datetime = have_datetime;
-	parser->divemode = divemode;
-
-	// Gradient factors and gas mixes from the appended /Summary section.
-	parser->ngasmixes = 0;
-	parser->have_decomodel = 0;
-	parser->have_salinity = 0;
-	memset (&parser->salinity, 0, sizeof (parser->salinity));
-	memset (parser->gasmix, 0, sizeof (parser->gasmix));
-	memset (parser->gasvolume, 0, sizeof (parser->gasvolume));
-	memset (&parser->decomodel, 0, sizeof (parser->decomodel));
-	if (profile_size < abstract->size) {
-		const unsigned char *sbem = abstract->data + profile_size;
-		size_t sbem_size = abstract->size - profile_size;
-		suunto_nautic_parse_summary (parser, sbem, sbem_size);
-
-		// The watch's maximum is deeper than any logged sample (the app shows
-		// it). Trusted only on a record whose dive time agrees with the
-		// profile's, and when it is close to the sampled maximum. The same
-		// record's average depth and water temperature range are the app's
-		// figures too. The Ocean can store the temperature pair reversed (the
-		// app then shows Min 29.35 and Max 18.85 C), so it is ordered here.
-		const unsigned char *record = suunto_nautic_summary_dive_record (sbem, sbem_size);
-		if (record && parser->divetime > 0) {
-			double divetime = array_float_le (record + SUMMARY_DIVE_DIVETIME);
-			double depth = array_float_le (record + SUMMARY_DIVE_MAXDEPTH);
-			double computed = parser->divetime;
-			double tolerance = computed * 0.1 > 30.0 ? computed * 0.1 : 30.0;
-			if (divetime > 0.0 && divetime < 86400.0 && fabs (divetime - computed) <= tolerance) {
-				parser->divetime = (unsigned int) divetime;
-				if (maxdepth > 0.0 && depth >= maxdepth - 0.5 && depth <= maxdepth + 3.0)
-					parser->maxdepth = depth;
-				double avgdepth = array_float_le (record + SUMMARY_DIVE_AVGDEPTH);
-				if (avgdepth > 0.0 && avgdepth <= parser->maxdepth)
-					parser->avgdepth = avgdepth;
-				double tmin = 0.0, tmax = 0.0;
-				if (!suunto_nautic_summary_window_temperatures (sbem, sbem_size, &tmin, &tmax)) {
-					tmin = array_float_le (record + SUMMARY_DIVE_TEMP_MIN);
-					tmax = array_float_le (record + SUMMARY_DIVE_TEMP_MAX);
-				}
-				if (tmin > tmax) {
-					double t = tmin;
-					tmin = tmax;
-					tmax = t;
-				}
-				if (have_temperature && tmin > 250.0 && tmax < 330.0) {
-					parser->temperature_minimum = tmin - 273.15;
-					parser->temperature_maximum = tmax - 273.15;
-				}
-
-				size_t footer_size = 0;
-				const unsigned char *footer = suunto_nautic_summary_record (sbem, sbem_size, SUMMARY_FOOTER_RECORD, &footer_size);
-				for (unsigned int t = 0; footer && t < parser->ntanks; t++) {
-					suunto_nautic_tank_t *tk = &parser->tank[t];
-					size_t base = SUMMARY_FOOTER_GAS_BASE + (size_t) tk->gasmix * SUMMARY_GAS_STRIDE;
-					if (base + SUMMARY_GAS_STRIDE > footer_size)
-						continue;
-					int pa = (int) array_uint32_le (footer + base + (tk->field ? SUMMARY_FOOTER_GAS_END2 : SUMMARY_FOOTER_GAS_END1));
-					double bar = pa / 100000.0;
-					if (bar > 0.0 && bar <= tk->beginpressure + 1.0)
-						tk->endpressure = bar;
-				}
-			}
-		}
-	}
-
-	parser->cached = 1;
-
-	return DC_STATUS_SUCCESS;
-}
-
 static dc_status_t
 suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime)
 {
@@ -1071,14 +961,14 @@ suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetim
 			return status;
 	}
 
-	// The dive start is derived from the first GPS fix's absolute UTC. A dive
-	// without a surface GPS fix has no absolute clock in the stream; the caller
-	// falls back to the logbook id (which is that same timestamp).
 	if (!parser->have_datetime)
 		return DC_STATUS_UNSUPPORTED;
 
-	if (datetime && !dc_datetime_gmtime (datetime, parser->datetime))
-		return DC_STATUS_DATAFORMAT;
+	if (datetime) {
+		if (!dc_datetime_gmtime (datetime, parser->datetime / 1000))
+			return DC_STATUS_DATAFORMAT;
+		datetime->timezone = parser->timezone * 900;
+	}
 
 	return DC_STATUS_SUCCESS;
 }
@@ -1098,32 +988,38 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 	if (value == NULL)
 		return DC_STATUS_SUCCESS;
 
+	dc_gasmix_t *gasmix = (dc_gasmix_t *) value;
 	dc_tank_t *tank = (dc_tank_t *) value;
+	dc_location_t *location = (dc_location_t *) value;
+	dc_decomodel_t *decomodel = (dc_decomodel_t *) value;
+	dc_salinity_t *water = (dc_salinity_t *) value;
+	// Fresh, EN13319 and salt water.
+	static const double density[] = {1000.0, 1020.0, 1030.0};
 
 	switch (type) {
 	case DC_FIELD_DIVETIME:
-		*((unsigned int *) value) = parser->divetime;
+		*((unsigned int *) value) = (unsigned int) ((parser->divetime + 500) / 1000);
 		break;
 	case DC_FIELD_MAXDEPTH:
 		*((double *) value) = parser->maxdepth;
 		break;
 	case DC_FIELD_AVGDEPTH:
-		*((double *) value) = parser->avgdepth;
+		*((double *) value) = parser->depth_count ? parser->depth_sum / parser->depth_count : 0.0;
 		break;
 	case DC_FIELD_TEMPERATURE_SURFACE:
 		if (!parser->have_temperature)
 			return DC_STATUS_UNSUPPORTED;
-		*((double *) value) = parser->temperature_surface;
+		*((double *) value) = parser->temperature_surface / 100.0 - 273.15;
 		break;
 	case DC_FIELD_TEMPERATURE_MINIMUM:
 		if (!parser->have_temperature)
 			return DC_STATUS_UNSUPPORTED;
-		*((double *) value) = parser->temperature_minimum;
+		*((double *) value) = parser->temperature_minimum / 100.0 - 273.15;
 		break;
 	case DC_FIELD_TEMPERATURE_MAXIMUM:
 		if (!parser->have_temperature)
 			return DC_STATUS_UNSUPPORTED;
-		*((double *) value) = parser->temperature_maximum;
+		*((double *) value) = parser->temperature_maximum / 100.0 - 273.15;
 		break;
 	case DC_FIELD_TANK_COUNT:
 		*((unsigned int *) value) = parser->ntanks;
@@ -1134,8 +1030,8 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 		tank->type = DC_TANKVOLUME_NONE;
 		tank->volume = 0.0;
 		tank->workpressure = 0.0;
-		tank->beginpressure = parser->tank[flags].beginpressure;
-		tank->endpressure = parser->tank[flags].endpressure;
+		tank->beginpressure = parser->tank[flags].beginpressure / 100000.0;
+		tank->endpressure = parser->tank[flags].endpressure / 100000.0;
 		tank->gasmix = DC_GASMIX_UNKNOWN;
 		tank->usage = DC_USAGE_NONE;
 		// Link the tank to its gas (slot index) and expose the per-gas
@@ -1144,9 +1040,9 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 			unsigned int gi = parser->tank[flags].gasmix;
 			if (gi < parser->ngasmixes) {
 				tank->gasmix = gi;
-				if (parser->gasvolume[gi] > 0.0) {
+				if (parser->gasmix[gi].volume > 0.0) {
 					tank->type = DC_TANKVOLUME_METRIC;
-					tank->volume = parser->gasvolume[gi];
+					tank->volume = parser->gasmix[gi].volume * 1000.0;
 				}
 			}
 		}
@@ -1154,12 +1050,14 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 	case DC_FIELD_LOCATION:
 		if (!parser->have_location)
 			return DC_STATUS_UNSUPPORTED;
-		*((dc_location_t *) value) = parser->location;
+		location->latitude = parser->latitude / 1.0e7;
+		location->longitude = parser->longitude / 1.0e7;
+		location->altitude = 0.0;
 		break;
 	case DC_FIELD_ATMOSPHERIC:
 		if (!parser->have_atmospheric)
 			return DC_STATUS_UNSUPPORTED;
-		*((double *) value) = parser->atmospheric;
+		*((double *) value) = parser->atmospheric / 100000.0;
 		break;
 	case DC_FIELD_GASMIX_COUNT:
 		*((unsigned int *) value) = parser->ngasmixes;
@@ -1167,20 +1065,38 @@ suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, uns
 	case DC_FIELD_GASMIX:
 		if (flags >= parser->ngasmixes)
 			return DC_STATUS_INVALIDARGS;
-		*((dc_gasmix_t *) value) = parser->gasmix[flags];
+		gasmix->oxygen = parser->gasmix[flags].oxygen / 100.0;
+		gasmix->helium = parser->gasmix[flags].helium / 100.0;
+		gasmix->nitrogen = 1.0 - (parser->gasmix[flags].oxygen + parser->gasmix[flags].helium) / 100.0;
+		gasmix->usage = DC_USAGE_NONE;
 		break;
 	case DC_FIELD_DECOMODEL:
-		if (!parser->have_decomodel)
+		if (!parser->have_gf)
 			return DC_STATUS_UNSUPPORTED;
-		*((dc_decomodel_t *) value) = parser->decomodel;
+		decomodel->type = DC_DECOMODEL_BUHLMANN;
+		decomodel->conservatism = 0;
+		decomodel->params.gf.low = parser->gf_low;
+		decomodel->params.gf.high = parser->gf_high;
 		break;
-	case DC_FIELD_DIVEMODE:
-		*((dc_divemode_t *) value) = parser->divemode;
+	case DC_FIELD_PPO2_MAX:
+		if (!parser->have_ppo2max)
+			return DC_STATUS_UNSUPPORTED;
+		*((double *) value) = parser->ppo2max;
 		break;
 	case DC_FIELD_SALINITY:
-		if (!parser->have_salinity)
+		if (!parser->have_watertype)
 			return DC_STATUS_UNSUPPORTED;
-		*((dc_salinity_t *) value) = parser->salinity;
+		water->type = parser->watertype ? DC_WATER_SALT : DC_WATER_FRESH;
+		water->density = density[parser->watertype];
+		break;
+	case DC_FIELD_DIVEMODE:
+		// Open circuit unless the sport id says the dive was apnea. The
+		// Nautic/Ocean are recreational OC computers (no CCR/SCR), and with
+		// no activity chunk at all OC is the right default.
+		if (parser->have_sport && (parser->sport == SPORT_ID_FREEDIVE || parser->sport == SPORT_ID_MERMAIDING))
+			*((dc_divemode_t *) value) = DC_DIVEMODE_FREEDIVE;
+		else
+			*((dc_divemode_t *) value) = DC_DIVEMODE_OC;
 		break;
 	default:
 		return DC_STATUS_UNSUPPORTED;
