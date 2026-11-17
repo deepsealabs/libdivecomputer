@@ -57,6 +57,8 @@
 #define CHUNK_ACTIVITY        0x08 // [timeDelta:2][sportId:1][customModeId: ascii]
 // Suunto sport ids seen on the Nautic/Ocean, from the app's ActivityType:
 // 51 = scuba, 61 = free diving, 62 = mermaiding. Only the last two are apnea.
+// The Ocean is also a sports watch, and logs other sports the same way.
+#define SPORT_ID_SCUBA        51
 #define SPORT_ID_FREEDIVE     61
 #define SPORT_ID_MERMAIDING   62
 #define CHUNK_GPS             0x0B
@@ -226,6 +228,12 @@ typedef struct suunto_nautic_summary_t {
 	unsigned int nchunks;
 } suunto_nautic_summary_t;
 
+// The walk over the profile for its activity, before the /Summary.
+typedef struct suunto_nautic_activity_t {
+	suunto_nautic_parser_t *parser;
+	unsigned int diving; // a dive status record (0x16) was seen
+} suunto_nautic_activity_t;
+
 static dc_status_t suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime);
 static dc_status_t suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value);
 static dc_status_t suunto_nautic_parser_samples_foreach (dc_parser_t *abstract, dc_sample_callback_t callback, void *userdata);
@@ -387,6 +395,35 @@ suunto_nautic_parser_summary (dc_context_t *context, unsigned int id, const unsi
 		}
 		parser->ngasmixes++;
 	}
+
+	return DC_STATUS_SUCCESS;
+}
+
+// Read the sport from the activity record, and see whether the profile has
+// the dive status records, which every dive has and another activity
+// doesn't.
+static dc_status_t
+suunto_nautic_parser_activity (dc_context_t *context, unsigned int id, const unsigned char data[], unsigned int size, void *userdata)
+{
+	suunto_nautic_activity_t *a = (suunto_nautic_activity_t *) userdata;
+	suunto_nautic_parser_t *parser = a->parser;
+
+	if (id == CHUNK_ACTIVITY && !parser->have_sport) {
+		if (size < 3) {
+			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
+			return DC_STATUS_DATAFORMAT;
+		}
+		// [timeDelta:2][sportId:1][customModeId: ascii]. The sport id
+		// is the app's ActivityType; 61/62 are the apnea sports, every
+		// other diving id is open circuit.
+		parser->sport = data[2];
+		parser->have_sport = 1;
+	} else if (id == CHUNK_EXTENDED_STATUS) {
+		a->diving = 1;
+	}
+
+	if (parser->have_sport && a->diving)
+		return DC_STATUS_DONE;
 
 	return DC_STATUS_SUCCESS;
 }
@@ -808,16 +845,6 @@ suunto_nautic_parser_profile (dc_context_t *context, unsigned int id, const unsi
 		// Pa, after the time delta. The last surface pressure is used.
 		parser->have_atmospheric = 1;
 		parser->atmospheric = array_float_le (data + 2);
-	} else if (id == CHUNK_ACTIVITY) {
-		if (size < 3) {
-			ERROR (context, "Unexpected chunk size (%02x %u).", id, size);
-			return DC_STATUS_DATAFORMAT;
-		}
-		// [timeDelta:2][sportId:1][customModeId: ascii]. The sport id
-		// is the app's ActivityType; 61/62 are the apnea sports, every
-		// other diving id is open circuit.
-		parser->sport = data[2];
-		parser->have_sport = 1;
 	}
 
 	return DC_STATUS_SUCCESS;
@@ -877,6 +904,24 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->ppo2max = 0.0;
 	parser->have_watertype = 0;
 	parser->watertype = 0;
+
+	// The watch also logs the activities that aren't dives, such as runs,
+	// and their /Summary has no dive header. Tell them apart first, by a
+	// sport that isn't a diving one and no dive status records, so a dive
+	// with an unknown sport, or without one, is still parsed as a dive.
+	suunto_nautic_activity_t activity;
+	activity.parser = parser;
+	activity.diving = 0;
+
+	status = suunto_nautic_sbem_parse (abstract->context, profile, profile_size, suunto_nautic_parser_activity, &activity);
+	if (status != DC_STATUS_SUCCESS && status != DC_STATUS_DONE)
+		return status;
+
+	if (parser->have_sport && !activity.diving &&
+		parser->sport != SPORT_ID_SCUBA && parser->sport != SPORT_ID_FREEDIVE && parser->sport != SPORT_ID_MERMAIDING) {
+		WARNING (abstract->context, "Not a dive (activity %u).", parser->sport);
+		return DC_STATUS_UNSUPPORTED;
+	}
 
 	suunto_nautic_summary_t summary_state;
 	memset (&summary_state, 0, sizeof (summary_state));
