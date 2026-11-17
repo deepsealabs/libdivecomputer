@@ -71,6 +71,9 @@
  *     record holds the dive id (its start time, a UNIX timestamp) and its
  *     size, which is checked against the download. Dives are downloaded
  *     newest first, stopping at the first id matching the fingerprint.
+ *   - The list holds every activity the watch records, not only the dives
+ *     (the Ocean is also a sports watch). An entry whose /Summary names
+ *     another sport, without a dive header, is skipped before its /Data.
  *
  * Datetime:
  *   - The profile starts with the timeline base (chunk 0x01): the local

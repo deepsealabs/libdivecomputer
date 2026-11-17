@@ -125,6 +125,23 @@
 #define INFO_SERIAL   4
 #define INFO_FIRMWARE 6
 
+// The /Summary of an entry. A dive's starts with its dive header, record
+// 0x20 on the Ocean and the Nautic S and 0x21 on the Nautic (see the parser).
+// Every entry's has a Header record, with the start of the entry, which is
+// its id, as a local64 DateTime at 8 (the local time in ms in the low 7
+// bytes, the UTC offset in quarter hours as an int8 in the top byte), and
+// its sport as an int32 ActivityType at 36. The descriptors give the Header
+// its id, 0x24 or 0x25, so it is recognized by its DateTime instead.
+#define SUMMARY_DIVEHEADER_OCEAN  0x20
+#define SUMMARY_DIVEHEADER_NAUTIC 0x21
+#define HEADER_DATETIME  8
+#define HEADER_ACTIVITY 36
+
+// The diving sports: scuba, freediving and mermaiding.
+#define ACTIVITY_SCUBA      51
+#define ACTIVITY_FREEDIVE   61
+#define ACTIVITY_MERMAIDING 62
+
 #define NSTEPS 1000
 #define STEP(i,n) ((unsigned int) ((unsigned long long) NSTEPS * (i) / (n)))
 
@@ -168,6 +185,8 @@ typedef struct suunto_nautic_device_t {
 	// Fork only: the caller's buffer that carries a failed download over to
 	// a later connection (extension API), or NULL.
 	dc_buffer_t *resume;
+	// Fork only: the entries the last foreach left out as not dives.
+	unsigned int nondives;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -1229,15 +1248,77 @@ suunto_nautic_list (suunto_nautic_device_t *device, dc_buffer_t *entries)
 	return status;
 }
 
+// Tell an activity that isn't a dive, such as a run on the Ocean, by its
+// /Summary, before its /Data is downloaded: its Header gives another sport,
+// and its /Summary has no dive header. Anything else, a /Summary that can't
+// be read included, is taken as a dive, so no dive is left out.
+static int
+suunto_nautic_isdive (const unsigned char data[], size_t size, unsigned int id, unsigned int *activity)
+{
+	size_t offset = 8;
+	unsigned int count = 0;
+
+	if (size < 8 || memcmp (data, "SBEM", 4) != 0)
+		return 1;
+
+	// The records are ID LENGTH DATA(LENGTH), as in the parser.
+	while (offset < size) {
+		const unsigned char *record = NULL;
+		unsigned int type = data[offset];
+		size_t header = 1, length = 0;
+
+		if (type == 0xFF) {
+			if (size - offset < 3)
+				return 1;
+			type = array_uint16_le (data + offset + 1);
+			header += 2;
+		}
+
+		if (size - offset < header + 1)
+			return 1;
+		length = data[offset + header];
+		header++;
+		if (length == 0xFF) {
+			if (size - offset < header + 4)
+				return 1;
+			length = array_uint32_le (data + offset + header);
+			header += 4;
+		}
+
+		if (length > size - offset - header)
+			return 1;
+
+		if (count++ == 0 && (type == SUMMARY_DIVEHEADER_OCEAN || type == SUMMARY_DIVEHEADER_NAUTIC))
+			return 1;
+
+		// The Header starts within two seconds of the id.
+		record = data + offset + header;
+		if (length >= HEADER_ACTIVITY + 4) {
+			dc_ticks_t start = (dc_ticks_t) (array_uint64_le (record + HEADER_DATETIME) & 0x00FFFFFFFFFFFFFFULL) / 1000 -
+				(signed char) record[HEADER_DATETIME + 7] * 900;
+			if (start >= id && start <= (dc_ticks_t) id + 2) {
+				*activity = array_uint32_le (record + HEADER_ACTIVITY);
+				return *activity == ACTIVITY_SCUBA || *activity == ACTIVITY_FREEDIVE || *activity == ACTIVITY_MERMAIDING;
+			}
+		}
+
+		offset += header + length;
+	}
+
+	return 1;
+}
+
 // Download one dive as SUMMARY_SIZE(4) SUMMARY PROFILE: the /Summary, with
 // the fields that are not in the profile (gradient factors, gas mixes), like
 // a dive header, and then the decompressed /Data stream. Both are SBEM0103
 // containers, which don't store their own size, hence the size in front.
 // The listed size is the compressed /Data plus the /Summary data bytes,
 // exactly, and a mismatch fails the download. Checking the content is left
-// to the parser.
+// to the parser. An entry that isn't a dive stops after its /Summary, with
+// isdive 0. Fork only: a NULL isdive, from the by-id download, downloads any
+// entry.
 static dc_status_t
-suunto_nautic_download (suunto_nautic_device_t *device, dc_event_progress_t *event, unsigned int id, unsigned int listed, unsigned int checked, dc_buffer_t *buffer)
+suunto_nautic_download (suunto_nautic_device_t *device, dc_event_progress_t *event, unsigned int id, unsigned int listed, unsigned int checked, dc_buffer_t *buffer, int *isdive)
 {
 	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
@@ -1283,6 +1364,15 @@ suunto_nautic_download (suunto_nautic_device_t *device, dc_event_progress_t *eve
 
 	size_t summary_size = dc_buffer_get_size (buffer) - sizeof (header);
 	array_uint32_le_set (dc_buffer_get_data (buffer), summary_size);
+
+	if (isdive) {
+		unsigned int activity = 0;
+		*isdive = suunto_nautic_isdive (dc_buffer_get_data (buffer) + sizeof (header), summary_size, id, &activity);
+		if (!*isdive) {
+			WARNING (abstract->context, "Skipping entry %u, not a dive (activity %u).", id, activity);
+			goto error_free;
+		}
+	}
 
 	// Fork only: the resumed download, which only the /Data can stall.
 	resumed = kept;
@@ -1418,6 +1508,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 	device->acknowledged = 0;
 	device->resume = NULL;
+	device->nondives = 0;
 
 	status = dc_hdlc_open (&device->iostream, context, iostream, 244, 244);
 	if (status != DC_STATUS_SUCCESS) {
@@ -1506,6 +1597,9 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 	dc_event_progress_t progress = EVENT_PROGRESS_INITIALIZER;
 	device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
 
+	// Fork only.
+	device->nondives = 0;
+
 	status = suunto_nautic_devinfo (device);
 	if (status != DC_STATUS_SUCCESS)
 		return status;
@@ -1545,6 +1639,7 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 		const unsigned char *record = records + (count - 1 - i) * ENTRY_SIZE;
 		unsigned int id = array_uint32_le (record + ENTRY_START);
 		unsigned int listed = array_uint32_le (record + ENTRY_LENGTH);
+		int isdive = 0;
 
 		// The size is optional in the API, but no watch has been seen to list
 		// an entry without one, or with one that needs more than 32 bits.
@@ -1561,7 +1656,7 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 			break;
 		}
 
-		status = suunto_nautic_download (device, &progress, id, listed, 1, buffer);
+		status = suunto_nautic_download (device, &progress, id, listed, 1, buffer, &isdive);
 		if (status != DC_STATUS_SUCCESS) {
 			// Stop here: the fingerprint of a newer dive would mark this one
 			// as downloaded.
@@ -1571,6 +1666,13 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 
 		progress.current = (i + 2) * NSTEPS;
 		device_event_emit (abstract, DC_EVENT_PROGRESS, &progress);
+
+		// Not a dive: left out, but the walk goes on, and the fingerprint
+		// stays the newest dive's.
+		if (!isdive) {
+			device->nondives++; // Fork only.
+			continue;
+		}
 
 		// The fingerprint is the id, as it is stored in the record.
 		if (callback && !callback (dc_buffer_get_data (buffer), dc_buffer_get_size (buffer), record + ENTRY_START, sizeof (device->fingerprint), userdata))
@@ -1869,7 +1971,7 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 	}
 	dc_buffer_free (entries);
 
-	status = suunto_nautic_download (device, NULL, (unsigned int) id, listed, record != NULL, raw);
+	status = suunto_nautic_download (device, NULL, (unsigned int) id, listed, record != NULL, raw, NULL);
 	if (status != DC_STATUS_SUCCESS)
 		dc_buffer_clear (raw);
 
@@ -1883,6 +1985,17 @@ suunto_nautic_device_set_resume (dc_device_t *abstract, dc_buffer_t *resume)
 		return DC_STATUS_INVALIDARGS;
 
 	((suunto_nautic_device_t *) abstract)->resume = resume;
+
+	return DC_STATUS_SUCCESS;
+}
+
+dc_status_t
+suunto_nautic_device_get_nondives (dc_device_t *abstract, unsigned int *count)
+{
+	if (!suunto_nautic_is_device (abstract) || count == NULL)
+		return DC_STATUS_INVALIDARGS;
+
+	*count = ((suunto_nautic_device_t *) abstract)->nondives;
 
 	return DC_STATUS_SUCCESS;
 }

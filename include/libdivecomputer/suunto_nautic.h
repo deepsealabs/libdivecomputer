@@ -155,6 +155,15 @@ dc_status_t
 suunto_nautic_device_get_resume (dc_device_t *device, unsigned int id, unsigned int *size);
 
 /*
+ * The number of entries the last dc_device_foreach() left out because they
+ * aren't dives: the watch lists every activity it records, and foreach skips
+ * one whose /Summary names another sport, before its /Data. The by-id
+ * download fetches any entry.
+ */
+dc_status_t
+suunto_nautic_device_get_nondives (dc_device_t *device, unsigned int *count);
+
+/*
  * Value subscriptions (e.g. "/Logbook/UnsynchronisedLogs", "/Sync/BusyState").
  * subscribe writes the resource handle and the current value; the value is
  * Whiteboard-encoded as [type:u16 LE][value...]. wait_notification returns the
