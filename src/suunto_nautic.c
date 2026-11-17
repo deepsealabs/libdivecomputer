@@ -166,9 +166,11 @@
 // using the watch. Waiting packets come back at once and the drain ends at
 // the first read that times out, so an app that is busy right now doesn't
 // keep it going: the first request then sees its traffic. DRAIN_MAX only
-// bounds the backlog, which a long app sync (hundreds of replies) can fill.
+// bounds the backlog. The other app's /Data stream reaches us too, a packet
+// per chunk: a 1 MB dive leaves over 4,000, and a long app sync thousands of
+// replies.
 #define DRAIN_MS  10
-#define DRAIN_MAX 1024
+#define DRAIN_MAX 65536
 
 // Fork only: why the device stepped aside for another app (taken_over).
 #define TAKEN_ACTIVE 1 // the other app is using the watch; our stream is still ours
@@ -1054,7 +1056,6 @@ error_unsubscribe:
 			// reply then never arrives whole.
 			WARNING (abstract->context, "Another app ended the stream (error code %u).", errcode);
 			device->taken_over = TAKEN_STREAM;
-			dc_status_set_error (&status, DC_STATUS_IO);
 		} else if (rc != DC_STATUS_SUCCESS) {
 			ERROR (abstract->context, "Failed to unsubscribe from %s.", path);
 			dc_status_set_error (&status, rc);
@@ -1083,10 +1084,12 @@ error_release:
 	}
 error_exit:
 	device->stream = 0;
-	// Fork only: with the stream of ours stopped, step aside.
+	// Fork only: with the stream of ours stopped, step aside. A step-aside
+	// fails the download with DC_STATUS_IO, whatever ended the stream: after
+	// a hello that cut off a chunk, the read times out first.
 	if (device->taken_over) {
 		suunto_nautic_step_aside (device);
-		dc_status_set_error (&status, DC_STATUS_IO);
+		status = DC_STATUS_IO;
 	}
 	return status;
 }
@@ -1781,9 +1784,26 @@ suunto_nautic_drain (suunto_nautic_device_t *device)
 	}
 
 	if (packets)
-		INFO (device->base.context, "Dropped %u packets left from before the download.", packets);
+		INFO (device->base.context, "Dropped %u packets left from before.", packets);
 
 	return dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+}
+
+// Fork only: the start of every download, listing or fetch of dive data, by
+// foreach or by id: a device that stepped aside sends nothing more, and the
+// packets left from before are dropped.
+static dc_status_t
+suunto_nautic_begin (suunto_nautic_device_t *device)
+{
+	if (device->taken_over) {
+		ERROR (device->base.context, "Another app has the link; not sending.");
+		return DC_STATUS_IO;
+	}
+
+	dc_status_t status = suunto_nautic_drain (device);
+	if (status != DC_STATUS_SUCCESS)
+		ERROR (device->base.context, "Failed to drop the packets left from before.");
+	return status;
 }
 
 dc_status_t
@@ -1887,6 +1907,10 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		status = DC_STATUS_SUCCESS;
 	} else if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to receive the hello.");
+		// Fork only: another app's traffic in reply to the hello: as busy as
+		// above.
+		if (device->taken_over)
+			status = DC_STATUS_TIMEOUT;
 		goto error_close;
 	} else if (hello_len != sizeof (hello) || hello[0] != 0x09 || hello[1] != 0x09) {
 		// The reply has the layout of the hello, and the same protocol versions.
@@ -1952,11 +1976,9 @@ suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback
 
 	// Fork only.
 	device->nondives = 0;
-	status = suunto_nautic_drain (device);
-	if (status != DC_STATUS_SUCCESS) {
-		ERROR (abstract->context, "Failed to drop the packets left from before.");
+	status = suunto_nautic_begin (device);
+	if (status != DC_STATUS_SUCCESS)
 		return status;
-	}
 
 	status = suunto_nautic_devinfo (device);
 	if (status != DC_STATUS_SUCCESS)
@@ -2088,6 +2110,15 @@ suunto_nautic_device_handshake_acknowledged (dc_device_t *abstract)
 	return ((suunto_nautic_device_t *) abstract)->acknowledged;
 }
 
+int
+suunto_nautic_device_taken_over (dc_device_t *abstract)
+{
+	if (!suunto_nautic_is_device (abstract))
+		return 0;
+
+	return ((suunto_nautic_device_t *) abstract)->taken_over != 0;
+}
+
 dc_status_t
 suunto_nautic_device_request (dc_device_t *abstract, const char *path, dc_buffer_t *response)
 {
@@ -2187,11 +2218,15 @@ suunto_nautic_device_list (dc_device_t *abstract, dc_buffer_t *ids)
 	if (!suunto_nautic_is_device (abstract) || ids == NULL)
 		return DC_STATUS_INVALIDARGS;
 
+	dc_status_t status = suunto_nautic_begin ((suunto_nautic_device_t *) abstract);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
 	dc_buffer_t *entries = dc_buffer_new (0);
 	if (entries == NULL)
 		return DC_STATUS_NOMEMORY;
 
-	dc_status_t status = suunto_nautic_list ((suunto_nautic_device_t *) abstract, entries);
+	status = suunto_nautic_list ((suunto_nautic_device_t *) abstract, entries);
 	if (status != DC_STATUS_SUCCESS) {
 		dc_buffer_free (entries);
 		return status;
@@ -2262,6 +2297,10 @@ suunto_nautic_device_fetch_paged (dc_device_t *abstract, const char *path, dc_bu
 	if (!suunto_nautic_is_device (abstract) || path == NULL || response == NULL)
 		return DC_STATUS_INVALIDARGS;
 
+	dc_status_t status = suunto_nautic_begin ((suunto_nautic_device_t *) abstract);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
 	return suunto_nautic_fetch_all ((suunto_nautic_device_t *) abstract, path, response);
 }
 
@@ -2275,6 +2314,10 @@ suunto_nautic_device_download_summary (dc_device_t *abstract, const char *logboo
 	int n = snprintf (path, sizeof (path), "/Logbook/byId/%s/Summary", logbook_id);
 	if (n < 0 || (size_t) n >= sizeof (path))
 		return DC_STATUS_INVALIDARGS;
+
+	dc_status_t status = suunto_nautic_begin ((suunto_nautic_device_t *) abstract);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
 
 	return suunto_nautic_fetch_all ((suunto_nautic_device_t *) abstract, path, summary);
 }
@@ -2294,13 +2337,17 @@ suunto_nautic_device_download (dc_device_t *abstract, const char *logbook_id, dc
 
 	dc_buffer_clear (raw);
 
+	dc_status_t status = suunto_nautic_begin (device);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
 	// The listed size to check the download against; a dive that isn't
 	// listed is downloaded without the check.
 	const unsigned char *record = NULL;
 	dc_buffer_t *entries = dc_buffer_new (0);
 	if (entries == NULL)
 		return DC_STATUS_NOMEMORY;
-	dc_status_t status = suunto_nautic_list (device, entries);
+	status = suunto_nautic_list (device, entries);
 	if (status == DC_STATUS_SUCCESS) {
 		const unsigned char *records = dc_buffer_get_data (entries);
 		unsigned int count = dc_buffer_get_size (entries) / ENTRY_SIZE;
