@@ -127,6 +127,12 @@
 #define GAS_PO2MAX        5  // float32 LE, bar
 #define GAS_VOLUME        9  // float32 LE, m^3
 
+// Every /Summary, a dive's or another activity's, also has a Header record:
+// the start of the entry, which is its id, as a local64 DateTime (see the
+// timeline base) at 8, and the sport as an int32 ActivityType at 36.
+#define ENTRY_START 8
+#define ENTRY_SPORT 36
+
 // The ids from 0x20 up aren't fixed: the descriptors the watch serves with
 // each dive assign them. Two sets have been seen, in which each of those ids
 // differs by one, in the /Summary and in the profile alike: on the Nautic S
@@ -233,6 +239,15 @@ typedef struct suunto_nautic_activity_t {
 	suunto_nautic_parser_t *parser;
 	unsigned int diving; // a dive status record (0x16) was seen
 } suunto_nautic_activity_t;
+
+// The walk over the /Summary of an entry for what it is, before its /Data.
+typedef struct suunto_nautic_entry_t {
+	unsigned int id; // the entry id, its start
+	unsigned int nchunks;
+	unsigned int diveheader;
+	unsigned int have_sport;
+	unsigned int sport; // the Header's ActivityType
+} suunto_nautic_entry_t;
 
 static dc_status_t suunto_nautic_parser_get_datetime (dc_parser_t *abstract, dc_datetime_t *datetime);
 static dc_status_t suunto_nautic_parser_get_field (dc_parser_t *abstract, dc_field_type_t type, unsigned int flags, void *value);
@@ -427,6 +442,57 @@ suunto_nautic_parser_diveheader (dc_context_t *context, unsigned int id, const u
 	*diveheader = suunto_nautic_isdiveheader (id, size);
 
 	return DC_STATUS_DONE;
+}
+
+// Look for the dive header, and the sport in the Header. The descriptors
+// give the Header its id, 0x24 or 0x25, and without a dive header nothing
+// tells those layouts apart, so the Header is the record that starts with
+// the entry instead: 0.1 to 1.1 s after its id on every captured dive.
+static dc_status_t
+suunto_nautic_parser_entry (dc_context_t *context, unsigned int id, const unsigned char data[], unsigned int size, void *userdata)
+{
+	suunto_nautic_entry_t *entry = (suunto_nautic_entry_t *) userdata;
+
+	if (entry->nchunks++ == 0 && suunto_nautic_isdiveheader (id, size)) {
+		entry->diveheader = 1;
+		return DC_STATUS_DONE;
+	}
+
+	if (size >= ENTRY_SPORT + 4) {
+		dc_ticks_t start = (dc_ticks_t) (array_uint64_le (data + ENTRY_START) & 0x00FFFFFFFFFFFFFFULL) / 1000 -
+			(signed char) data[ENTRY_START + 7] * 900;
+		if (start >= entry->id && start <= (dc_ticks_t) entry->id + 2) {
+			entry->sport = array_uint32_le (data + ENTRY_SPORT);
+			entry->have_sport = 1;
+			return DC_STATUS_DONE;
+		}
+	}
+
+	return DC_STATUS_SUCCESS;
+}
+
+int
+suunto_nautic_parser_isdive (const unsigned char data[], unsigned int size, unsigned int id, unsigned int *sport)
+{
+	dc_status_t status = DC_STATUS_SUCCESS;
+	suunto_nautic_entry_t entry;
+
+	memset (&entry, 0, sizeof (entry));
+	entry.id = id;
+
+	// No context: the parser reports a /Summary it can't read, once.
+	status = suunto_nautic_sbem_parse (NULL, data, size, suunto_nautic_parser_entry, &entry);
+	if (status != DC_STATUS_SUCCESS && status != DC_STATUS_DONE)
+		return 1;
+
+	// A dive header is dive data, whatever the sport.
+	if (entry.diveheader || !entry.have_sport)
+		return 1;
+
+	if (sport)
+		*sport = entry.sport;
+
+	return suunto_nautic_isdivesport (entry.sport);
 }
 
 // Read the sport from the activity record, and see whether the profile has

@@ -106,6 +106,17 @@ suunto_nautic_device_open (dc_device_t **device, dc_context_t *context, dc_iostr
 dc_status_t
 suunto_nautic_parser_create (dc_parser_t **parser, dc_context_t *context, const unsigned char data[], size_t size);
 
+/*
+ * Whether the /Summary of a logbook entry is a dive's, for the driver to
+ * leave out another activity before its /Data. An entry isn't a dive only
+ * when its Header gives another sport than scuba, freediving or mermaiding,
+ * and its /Summary doesn't start with a dive header. Anything else, a
+ * /Summary that can't be read included, is a dive. The sport is the
+ * Header's, set when the Header is found.
+ */
+int
+suunto_nautic_parser_isdive (const unsigned char data[], unsigned int size, unsigned int id, unsigned int *sport);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
