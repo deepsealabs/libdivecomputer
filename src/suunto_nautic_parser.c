@@ -399,6 +399,36 @@ suunto_nautic_parser_summary (dc_context_t *context, unsigned int id, const unsi
 	return DC_STATUS_SUCCESS;
 }
 
+static int
+suunto_nautic_isdivesport (unsigned int sport)
+{
+	return sport == SPORT_ID_SCUBA || sport == SPORT_ID_FREEDIVE || sport == SPORT_ID_MERMAIDING;
+}
+
+// Whether a chunk is a dive header: the id of a layout's, with the size the
+// layout needs. Another record with that id is smaller.
+static int
+suunto_nautic_isdiveheader (unsigned int id, unsigned int size)
+{
+	for (unsigned int i = 0; i < C_ARRAY_SIZE (suunto_nautic_layouts); i++) {
+		if (suunto_nautic_layouts[i].header == id)
+			return size >= HEADER_GAS + suunto_nautic_layouts[i].ngases * HEADER_GAS_SIZE;
+	}
+
+	return 0;
+}
+
+// See whether the first chunk of the /Summary is a dive header.
+static dc_status_t
+suunto_nautic_parser_diveheader (dc_context_t *context, unsigned int id, const unsigned char data[], unsigned int size, void *userdata)
+{
+	int *diveheader = (int *) userdata;
+
+	*diveheader = suunto_nautic_isdiveheader (id, size);
+
+	return DC_STATUS_DONE;
+}
+
 // Read the sport from the activity record, and see whether the profile has
 // the dive status records, which every dive has and another activity
 // doesn't.
@@ -905,10 +935,10 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	parser->have_watertype = 0;
 	parser->watertype = 0;
 
-	// The watch also logs the activities that aren't dives, such as runs,
-	// and their /Summary has no dive header. Tell them apart first, by a
-	// sport that isn't a diving one and no dive status records, so a dive
-	// with an unknown sport, or without one, is still parsed as a dive.
+	// The watch also logs the activities that aren't dives, such as runs.
+	// Tell them apart first: a sport that isn't a diving one, and no dive
+	// data, neither dive status records nor a dive header in the /Summary.
+	// A dive with an unknown sport, or without one, is parsed as a dive.
 	suunto_nautic_activity_t activity;
 	activity.parser = parser;
 	activity.diving = 0;
@@ -917,10 +947,14 @@ suunto_nautic_parser_parse (dc_parser_t *abstract, dc_sample_callback_t callback
 	if (status != DC_STATUS_SUCCESS && status != DC_STATUS_DONE)
 		return status;
 
-	if (parser->have_sport && !activity.diving &&
-		parser->sport != SPORT_ID_SCUBA && parser->sport != SPORT_ID_FREEDIVE && parser->sport != SPORT_ID_MERMAIDING) {
-		WARNING (abstract->context, "Not a dive (activity %u).", parser->sport);
-		return DC_STATUS_UNSUPPORTED;
+	if (parser->have_sport && !activity.diving && !suunto_nautic_isdivesport (parser->sport)) {
+		// No context: a dive's /Summary is walked again below, errors and all.
+		int diveheader = 0;
+		suunto_nautic_sbem_parse (NULL, summary, summary_size, suunto_nautic_parser_diveheader, &diveheader);
+		if (!diveheader) {
+			WARNING (abstract->context, "Not a dive (activity %u).", parser->sport);
+			return DC_STATUS_UNSUPPORTED;
+		}
 	}
 
 	suunto_nautic_summary_t summary_state;
