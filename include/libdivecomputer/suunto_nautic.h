@@ -26,6 +26,13 @@
  * supported and is the normal way to download dives. These additional
  * entry points let a client download or list by logbook id directly, and
  * expose the underlying RPC transport for protocol exploration.
+ *
+ * dc_device_foreach(), suunto_nautic_device_list(),
+ * suunto_nautic_device_download(), suunto_nautic_device_download_summary()
+ * and suunto_nautic_device_fetch_paged() first drop the packets left on the
+ * link since the last call, such as the watch's replies to another app that
+ * has since finished, so that only another app's traffic during the call
+ * makes the device step aside (see suunto_nautic_device_taken_over()).
  */
 
 #ifndef DC_SUUNTO_NAUTIC_H
@@ -48,9 +55,27 @@ extern "C" {
  * 1 when the watch answered the EVA handshake on open. The open still succeeds
  * when only other frames arrived before the link went quiet (a sleeping watch
  * or the tail of an earlier stream), so 0 means the first request may time out.
+ *
+ * The open fails with DC_STATUS_TIMEOUT only when another app is using the
+ * watch: it waits for the link to go quiet (about 20 s at most) and gives up
+ * if it doesn't. The host can try again later. A watch that is asleep opens
+ * with this returning 0.
  */
 int
 suunto_nautic_device_handshake_acknowledged (dc_device_t *device);
+
+/*
+ * 1 once the device has stepped aside for another app using the watch (a
+ * reply to its request, its hello, or a stream it ended), 0 otherwise. The
+ * call that saw it fails with DC_STATUS_IO, the status a lost link also gives,
+ * after waiting (about 20 s at most) for the other app to finish. From then on
+ * the device sends nothing more: every call fails with DC_STATUS_IO, so the
+ * host closes it and opens a new one, once the other app is done, to carry on.
+ * What was downloaded before is kept for a resume, see
+ * suunto_nautic_device_set_resume().
+ */
+int
+suunto_nautic_device_taken_over (dc_device_t *device);
 
 dc_status_t
 suunto_nautic_device_request (dc_device_t *device, const char *path, dc_buffer_t *response);
@@ -131,8 +156,10 @@ suunto_nautic_device_download (dc_device_t *device, const char *logbook_id, dc_b
  * opens for that watch; NULL detaches it. The device doesn't own it, so it
  * must outlive the device or be detached first.
  *
- * When a listed dive fails to download because the link went or the
- * download was cancelled (DC_STATUS_TIMEOUT, _IO, _NODEVICE, _CANCELLED),
+ * When a listed dive fails to download because the link went, another app
+ * was using the watch (DC_STATUS_IO, after waiting for it to finish; try
+ * again once it is done),
+ * or the download was cancelled (DC_STATUS_TIMEOUT, _IO, _NODEVICE, _CANCELLED),
  * the device keeps the compressed /Data received so far in `resume`. The
  * next download of the same dive, by dc_device_foreach() or
  * suunto_nautic_device_download(), on this device or a later one, fetches
