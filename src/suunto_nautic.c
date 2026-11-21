@@ -123,8 +123,13 @@
 // 2604C3003306).
 #define INFO_TYPE     0x2F02
 #define INFO_STRUCT   6
+#define INFO_PRODUCT  1
 #define INFO_SERIAL   4
 #define INFO_FIRMWARE 6
+
+// The models of the descriptor table, which /Info's product names.
+#define NAUTIC 0
+#define OCEAN  1
 
 #define NSTEPS 1000
 #define STEP(i,n) ((unsigned int) ((unsigned long long) NSTEPS * (i) / (n)))
@@ -1461,8 +1466,20 @@ suunto_nautic_devinfo (suunto_nautic_device_t *device)
 		goto error_free;
 	}
 
+	// The product is "Nautic" on the Nautic and "Ocean" on the Ocean. The table
+	// has no row for the Nautic S, so any "Nautic" product is the Nautic, and
+	// so is an unknown one, as every watch was before the product was read.
+	const char *product = suunto_nautic_info_string (data, size, INFO_PRODUCT);
+	unsigned int model = NAUTIC;
+	if (product != NULL && strcmp (product, "Ocean") == 0) {
+		model = OCEAN;
+	} else if (product == NULL || strncmp (product, "Nautic", 6) != 0) {
+		WARNING (abstract->context, "Unknown product '%s' in the device info.", product ? product : "");
+	}
+
 	dc_event_devinfo_t devinfo;
 	memset (&devinfo, 0, sizeof (devinfo));
+	devinfo.model = model;
 	devinfo.firmware = (major << 16) | (minor << 8) | patch;
 	devinfo.serial = array_uint32_be (number);
 
