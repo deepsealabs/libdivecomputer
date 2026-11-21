@@ -266,16 +266,15 @@ suunto_nautic_send (suunto_nautic_device_t *device, unsigned char opcode, unsign
 }
 
 // Another app's packets can keep coming while ours never does, so skipping
-// them ends after TIMEOUT_SKIP without one of ours, or at a cancel, except
-// for the UNSUBSCRIBE and RELEASE replies (see send()).
+// them ends after TIMEOUT_SKIP without one of ours. A cancel ends only a wait
+// for a notification, so it never loses a request's handle or subscription.
 static dc_status_t
 suunto_nautic_skip (suunto_nautic_device_t *device, unsigned char opcode, dc_usecs_t begin)
 {
 	dc_status_t status = DC_STATUS_SUCCESS;
 	dc_device_t *abstract = (dc_device_t *) device;
 
-	if (opcode != RPC_OP_UNSUBSCRIBE_REPLY && opcode != RPC_OP_RELEASE_REPLY &&
-		device_is_cancelled (abstract))
+	if (opcode == RPC_OP_NOTIFICATION && device_is_cancelled (abstract))
 		return DC_STATUS_CANCELLED;
 
 	dc_usecs_t now = 0;
@@ -771,6 +770,9 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 		handle, suunto_nautic_noparams, sizeof (suunto_nautic_noparams), reply, sizeof (reply), NULL, &errcode);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to subscribe to %s.", path);
+		// Without its reply, the watch may have subscribed all the same.
+		if (status == DC_STATUS_TIMEOUT)
+			goto error_unsubscribe;
 		goto error_release;
 	}
 
