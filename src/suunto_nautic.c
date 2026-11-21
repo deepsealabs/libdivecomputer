@@ -174,6 +174,9 @@ typedef struct suunto_nautic_device_t {
 	dc_buffer_t *resume;
 	// Fork only: the entries the last foreach left out as not dives.
 	unsigned int nondives;
+	// Fork only: set while the extension API waits for a notification, where
+	// a timeout without a byte received is the usual outcome, not an error.
+	int polling;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -314,7 +317,8 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 	while (1) {
 		status = dc_iostream_read (device->iostream, packet, sizeof(packet), &length);
 		if (status != DC_STATUS_SUCCESS) {
-			ERROR (device->base.context, "Failed to receive the packet.");
+			if (!(device->polling && status == DC_STATUS_TIMEOUT && length == 0))
+				ERROR (device->base.context, "Failed to receive the packet.");
 			return status;
 		}
 
@@ -1496,6 +1500,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	device->acknowledged = 0;
 	device->resume = NULL;
 	device->nondives = 0;
+	device->polling = 0;
 
 	status = dc_timer_new (&device->timer);
 	if (status != DC_STATUS_SUCCESS) {
@@ -2134,7 +2139,9 @@ suunto_nautic_device_wait_notification (dc_device_t *abstract, unsigned int time
 	// A value notification is HANDLE(3) FLAGS(3) TYPE(2) VALUE.
 	unsigned char data[MAX_PAYLOAD] = {0};
 	size_t size = 0;
+	device->polling = 1;
 	status = suunto_nautic_recv (device, RPC_OP_NOTIFICATION, 0, data, sizeof (data), &size);
+	device->polling = 0;
 	if (status == DC_STATUS_SUCCESS && size < 6) {
 		ERROR (abstract->context, "Unexpected notification size (" DC_PRINTF_SIZE ").", size);
 		status = DC_STATUS_PROTOCOL;

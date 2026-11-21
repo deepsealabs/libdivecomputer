@@ -168,7 +168,8 @@ suunto_nautic_device_get_nondives (dc_device_t *device, unsigned int *count);
  * subscribe writes the resource handle and the current value; the value is
  * Whiteboard-encoded as [type:u16 LE][value...]. wait_notification returns the
  * next pushed value on any subscribed handle, or DC_STATUS_TIMEOUT after
- * `timeout` milliseconds. Not valid while a dive download is in progress.
+ * `timeout` milliseconds without a byte received, which isn't logged as an
+ * error. Not valid while a dive download is in progress.
  * unsubscribe also releases the handle when it is a per-id slot.
  */
 dc_status_t
