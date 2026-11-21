@@ -163,6 +163,7 @@ typedef struct suunto_nautic_device_t {
 	dc_iostream_t *iostream; // HDLC-framed
 	dc_timer_t *timer;
 	unsigned int seqnum;
+	unsigned int stream; // the handle of the stream being received, 0 for none
 	// Fork only: whether the watch answered the hello (extension API).
 	int acknowledged;
 	// The dive id (a UNIX timestamp) of the most recently downloaded dive,
@@ -343,7 +344,12 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		unsigned int rsp_opcode = packet[1];
 		if (rsp_opcode != opcode) {
 			WARNING (device->base.context, "Skipping a packet with an unexpected opcode (%02x %02x).", rsp_opcode, opcode);
-			status = suunto_nautic_skip (device, opcode, begin);
+			// The rest of a stopped stream of ours shows the watch is still busy with us.
+			if (rsp_opcode == RPC_OP_NOTIFICATION && device->stream && rsp_length >= 3 &&
+				HANDLE_RESOURCE (array_uint24_le (packet + 6)) == HANDLE_RESOURCE (device->stream))
+				status = dc_timer_now (device->timer, &begin);
+			else
+				status = suunto_nautic_skip (device, opcode, begin);
 			if (status != DC_STATUS_SUCCESS)
 				return status;
 			continue;
@@ -763,6 +769,8 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 	if (status != DC_STATUS_SUCCESS)
 		return status;
 
+	device->stream = handle;
+
 	// The SUBSCRIBE and UNSUBSCRIBE replies carry two more bytes, 00 00.
 	unsigned char reply[2] = {0};
 	unsigned int errcode = 0;
@@ -915,6 +923,7 @@ error_release:
 	rc = suunto_nautic_release (device, handle);
 	if (rc != DC_STATUS_SUCCESS)
 		dc_status_set_error (&status, rc);
+	device->stream = 0;
 	return status;
 }
 
@@ -1482,6 +1491,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	// Fork only: carry on from the previous connection.
 	if (g_suunto_nautic_seqnum)
 		device->seqnum = g_suunto_nautic_seqnum;
+	device->stream = 0;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 	device->acknowledged = 0;
 	device->resume = NULL;
