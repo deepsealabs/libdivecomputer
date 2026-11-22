@@ -201,6 +201,10 @@
 // repeats one the watch still holds from the dropped session.
 static unsigned int g_suunto_nautic_seqnum = 0;
 
+// Fork only: how many of the sequence numbers up to the current one count as
+// ours, so that a late reply to one of them isn't taken for another app's.
+#define SEQNUM_RECENT 8
+
 typedef struct suunto_nautic_device_t {
 	dc_device_t base;
 	dc_iostream_t *iostream; // HDLC-framed
@@ -225,6 +229,9 @@ typedef struct suunto_nautic_device_t {
 	// device has waited for the other app since.
 	int taken_over;
 	int stepped_aside;
+	// Fork only: how many of the sequence numbers up to the current one were
+	// ours, up to SEQNUM_RECENT.
+	unsigned int nrecent;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
@@ -280,7 +287,21 @@ suunto_nautic_seqnum (suunto_nautic_device_t *device)
 	if (device->seqnum == 0)
 		device->seqnum = 1;
 
+	// Fork only.
+	if (device->nrecent < SEQNUM_RECENT)
+		device->nrecent++;
+
 	return device->seqnum;
+}
+
+// Fork only: whether a reply's sequence number is one of the last few we
+// used: a reply that arrives after its request gave up on it, such as the
+// probe's when it takes longer than TIMEOUT_PROBE, or a request a host tries
+// again after a timeout. It is skipped, not taken for another app's.
+static int
+suunto_nautic_ours (suunto_nautic_device_t *device, unsigned int seqnum)
+{
+	return seqnum != 0 && ((device->seqnum - seqnum) & 0xFFFF) < device->nrecent;
 }
 
 static dc_status_t
@@ -434,7 +455,8 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		// app, which then says hello again and ends our stream, and its hello
 		// ends the handles we hold. Step aside: what arrived before is still
 		// ours, and a new device waits for the link to go quiet on open.
-		if (rsp_opcode != RPC_OP_NOTIFICATION && (rsp_opcode != opcode || rsp_seqnum != seqnum)) {
+		if (rsp_opcode != RPC_OP_NOTIFICATION && (rsp_opcode != opcode || rsp_seqnum != seqnum) &&
+			!suunto_nautic_ours (device, rsp_seqnum)) {
 			// While waiting for a notification the device isn't using the
 			// watch, so another app's replies get in nobody's way. Only its
 			// hello, which ends our session and its subscriptions with it,
@@ -1840,9 +1862,14 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	// requests are unlikely to share a number with those of another app on
 	// the same link, whose replies we also receive.
 	device->seqnum = ((unsigned int) dc_datetime_now () * 2654435761u) & 0xFFFF;
-	// Fork only: carry on from the previous connection.
-	if (g_suunto_nautic_seqnum)
+	// Fork only: carry on from the previous connection, whose last sequence
+	// numbers count as ours: a device opened again on the same link can still
+	// get the late replies to them.
+	device->nrecent = 0;
+	if (g_suunto_nautic_seqnum) {
 		device->seqnum = g_suunto_nautic_seqnum;
+		device->nrecent = SEQNUM_RECENT;
+	}
 	device->stream = 0;
 	memset (device->fingerprint, 0, sizeof (device->fingerprint));
 	device->acknowledged = 0;
