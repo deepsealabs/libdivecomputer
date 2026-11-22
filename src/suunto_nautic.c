@@ -232,10 +232,15 @@ typedef struct suunto_nautic_device_t {
 	// Fork only: how many of the sequence numbers up to the current one were
 	// ours, up to SEQNUM_RECENT.
 	unsigned int nrecent;
+	// Fork only: whether the device uses another app's session instead of a
+	// hello of its own, and whether the link has been quiet since it opened.
+	int shared;
+	int quiet;
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
 static dc_status_t suunto_nautic_step_aside (suunto_nautic_device_t *device);
+static dc_status_t suunto_nautic_await_quiet (suunto_nautic_device_t *device);
 static dc_status_t suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata);
 static dc_status_t suunto_nautic_device_close (dc_device_t *abstract);
 
@@ -931,12 +936,19 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 		// Fork only: a stream that was never unsubscribed, because the app
 		// that asked for it was killed or lost the link, holds the watch's
 		// one stream after it ends: every SUBSCRIBE gets 423 until a hello.
-		// The link is quiet (the open waited for that), so it isn't another
-		// app's stream running; it was asked for in the session we share, and
-		// ours can end it, but only with an UNSUBSCRIBE from slot 0. So when
-		// its old binding put us in another slot, free both and bind again.
+		// Once the link has been quiet, it isn't another app's stream running
+		// (or between its end marker and its UNSUBSCRIBE); it was asked for in
+		// the session we share, and ours can end it, but only with an
+		// UNSUBSCRIBE from slot 0. So when its old binding put us in another
+		// slot, free both and bind again.
 		if (status != DC_STATUS_PROTOCOL || errcode != ERR_LOCKED || attempt >= 2)
 			break;
+
+		if (device->shared && !device->quiet) {
+			status = suunto_nautic_await_quiet (device);
+			if (status != DC_STATUS_SUCCESS)
+				goto error_release;
+		}
 
 		if (HANDLE_SLOT (handle) != 0) {
 			WARNING (abstract->context, "A stream left over from an earlier connection holds the watch (error code %u); freeing its slot.", errcode);
@@ -1740,9 +1752,11 @@ suunto_nautic_probe (suunto_nautic_device_t *device, int *shared, int *busy)
 }
 
 // Fork only: read and discard packets until the link has been quiet for
-// QUIET_MS: the traffic of another app using the watch.
+// QUIET_MS: the traffic of another app using the watch. `packets`, when not
+// NULL, gets how many arrived meanwhile. DC_STATUS_TIMEOUT means the link is
+// still busy after QUIET_MAX_S.
 static dc_status_t
-suunto_nautic_wait_quiet (suunto_nautic_device_t *device)
+suunto_nautic_wait_quiet (suunto_nautic_device_t *device, unsigned int *packets_out)
 {
 	dc_device_t *abstract = (dc_device_t *) device;
 	dc_status_t status = DC_STATUS_SUCCESS;
@@ -1794,6 +1808,9 @@ suunto_nautic_wait_quiet (suunto_nautic_device_t *device)
 	}
 
 	INFO (abstract->context, "The link is quiet (%u packets from the other app).", packets);
+	device->quiet = 1;
+	if (packets_out)
+		*packets_out = packets;
 	return DC_STATUS_SUCCESS;
 }
 
@@ -1811,10 +1828,36 @@ suunto_nautic_step_aside (suunto_nautic_device_t *device)
 	device->stepped_aside = 1;
 
 	WARNING (device->base.context, "Waiting for the other app to finish.");
-	dc_status_t status = suunto_nautic_wait_quiet (device);
+	dc_status_t status = suunto_nautic_wait_quiet (device, NULL);
 	dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
 
 	return status == DC_STATUS_CANCELLED ? status : DC_STATUS_IO;
+}
+
+// Fork only: on another app's session that the open didn't wait for, the
+// link must have been quiet before the device touches what may be that app's
+// stream. Traffic meanwhile means the app is using the watch: step aside.
+static dc_status_t
+suunto_nautic_await_quiet (suunto_nautic_device_t *device)
+{
+	unsigned int packets = 0;
+
+	INFO (device->base.context, "Waiting for a quiet link before ending the stream.");
+	dc_status_t status = suunto_nautic_wait_quiet (device, &packets);
+	dc_status_t rc = dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+	if (status == DC_STATUS_CANCELLED)
+		return status;
+
+	if (status == DC_STATUS_TIMEOUT || (status == DC_STATUS_SUCCESS && packets)) {
+		WARNING (device->base.context, "Another app is using the watch (%u packets).", packets);
+		device->taken_over = TAKEN_ACTIVE;
+		device->stepped_aside = 1;
+		return DC_STATUS_IO;
+	}
+
+	if (status == DC_STATUS_SUCCESS)
+		status = rc;
+	return status;
 }
 
 // Fork only: drop the packets left in the receive buffer since the last
@@ -1908,6 +1951,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	device->polling = 0;
 	device->taken_over = 0;
 	device->stepped_aside = 0;
+	device->shared = 0;
+	device->quiet = 0;
 
 	status = dc_timer_new (&device->timer);
 	if (status != DC_STATUS_SUCCESS) {
@@ -1943,7 +1988,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	status = suunto_nautic_probe (device, &shared, &busy);
 	if (status == DC_STATUS_SUCCESS && busy) {
 		INFO (context, "Another app is using the watch; waiting until it is done.");
-		status = suunto_nautic_wait_quiet (device);
+		status = suunto_nautic_wait_quiet (device, NULL);
 		if (status == DC_STATUS_TIMEOUT)
 			other_app = 1;
 		if (status == DC_STATUS_SUCCESS)
@@ -1970,6 +2015,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	if (shared) {
 		INFO (context, "Another app has a session on the link; using it instead of a hello of our own.");
 		device->acknowledged = 1;
+		device->shared = 1;
 		*out = (dc_device_t *) device;
 		return DC_STATUS_SUCCESS;
 	}
