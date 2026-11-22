@@ -1906,6 +1906,10 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	}
 
 	INFO (context, "No other session on the link (the request above went unanswered, as expected); saying hello.");
+	// Fork only: the open waits for the link once, for the probe. Another
+	// app's traffic in reply to the hello fails it without a second wait, and
+	// the host's next attempt does the waiting.
+	device->stepped_aside = 1;
 	status = suunto_nautic_send (device, RPC_OP_HELLO, 0, suunto_nautic_hello, sizeof (suunto_nautic_hello));
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to send the hello.");
@@ -1923,7 +1927,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	} else if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to receive the hello.");
 		// Fork only: another app's traffic in reply to the hello: as busy as
-		// above.
+		// above, without waiting again.
 		if (device->taken_over)
 			status = DC_STATUS_TIMEOUT;
 		goto error_close;
@@ -1935,6 +1939,9 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	} else {
 		device->acknowledged = 1;
 	}
+
+	// Fork only.
+	device->stepped_aside = 0;
 
 	*out = (dc_device_t *) device;
 

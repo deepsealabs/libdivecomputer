@@ -57,9 +57,9 @@ extern "C" {
  * or the tail of an earlier stream), so 0 means the first request may time out.
  *
  * The open fails with DC_STATUS_TIMEOUT only when another app is using the
- * watch: it waits for the link to go quiet (about 20 s at most) and gives up
- * if it doesn't. The host can try again later. A watch that is asleep opens
- * with this returning 0.
+ * watch: it waits once for the link to go quiet (about 20 s at most) and gives
+ * up if it doesn't, or if another app's traffic answers its hello. The host
+ * can try again later. A watch that is asleep opens with this returning 0.
  */
 int
 suunto_nautic_device_handshake_acknowledged (dc_device_t *device);
