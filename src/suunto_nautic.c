@@ -962,8 +962,9 @@ suunto_nautic_stream (suunto_nautic_device_t *device, const char *path, suunto_n
 	}
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (abstract->context, "Failed to subscribe to %s.", path);
-		// Without its reply, the watch may have subscribed all the same.
-		if (status == DC_STATUS_TIMEOUT)
+		// Without its reply, the watch may have subscribed all the same; fork
+		// only: also when another app's reply came first.
+		if (status == DC_STATUS_TIMEOUT || (status == DC_STATUS_IO && device->taken_over == TAKEN_ACTIVE))
 			goto error_unsubscribe;
 		goto error_release;
 	}
