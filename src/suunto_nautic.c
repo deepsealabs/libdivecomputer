@@ -141,6 +141,9 @@
 #define TIMEOUT_DEFAULT 5000
 #define TIMEOUT_STREAM  4000 // the gap between two chunks reaches about 2s
 #define TIMEOUT_SKIP    (3 * TIMEOUT_DEFAULT) // a reply takes up to about 1s, see suunto_nautic_skip
+// Fork only: how long the rest of a stopped stream of ours keeps a request's
+// reply waiting at most; a Nautic S /Data streams for 150 to 200 s.
+#define TIMEOUT_TAIL    200000
 
 // Fork only: another app (the Suunto app) may already have a session on the
 // link. Before a hello of our own, a GET without one: the watch answers it
@@ -387,6 +390,24 @@ suunto_nautic_skip_damaged (suunto_nautic_device_t *device, unsigned char opcode
 	return suunto_nautic_skip (device, opcode, begin);
 }
 
+// Fork only: a notification of the stream we stopped restarts the deadline on
+// the reply we wait for, up to TIMEOUT_TAIL after `start`, unless the host
+// cancelled; then it counts toward the deadline like any other packet.
+static dc_status_t
+suunto_nautic_skip_tail (suunto_nautic_device_t *device, unsigned char opcode, dc_usecs_t start, dc_usecs_t *begin)
+{
+	dc_usecs_t now = 0;
+	dc_status_t status = dc_timer_now (device->timer, &now);
+	if (status != DC_STATUS_SUCCESS)
+		return status;
+
+	if (device_is_cancelled ((dc_device_t *) device) || now - start >= (dc_usecs_t) TIMEOUT_TAIL * 1000)
+		return suunto_nautic_skip (device, opcode, *begin);
+
+	*begin = now;
+	return DC_STATUS_SUCCESS;
+}
+
 // Receive the packet with the given opcode and sequence number. The watch
 // serves every app connected to it over the same link, so other packets can
 // arrive in between. The notifications that are still on their way after a
@@ -407,6 +428,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 	status = dc_timer_now (device->timer, &begin);
 	if (status != DC_STATUS_SUCCESS)
 		return status;
+	const dc_usecs_t start = begin;
 
 	while (1) {
 		status = dc_iostream_read (device->iostream, packet, sizeof(packet), &length);
@@ -500,9 +522,11 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		if (rsp_opcode != opcode) {
 			WARNING (device->base.context, "Skipping a packet with an unexpected opcode (%02x %02x).", rsp_opcode, opcode);
 			// The rest of a stopped stream of ours shows the watch is still busy with us.
+			// Fork only: up to TIMEOUT_TAIL, and not after a cancel: another
+			// app's stream has the same resource.
 			if (rsp_opcode == RPC_OP_NOTIFICATION && device->stream && rsp_length >= 3 &&
 				HANDLE_RESOURCE (array_uint24_le (packet + 6)) == HANDLE_RESOURCE (device->stream))
-				status = dc_timer_now (device->timer, &begin);
+				status = suunto_nautic_skip_tail (device, opcode, start, &begin);
 			else
 				status = suunto_nautic_skip (device, opcode, begin);
 			if (status != DC_STATUS_SUCCESS)
