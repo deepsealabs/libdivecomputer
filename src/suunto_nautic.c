@@ -435,6 +435,18 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 		// ends the handles we hold. Step aside: what arrived before is still
 		// ours, and a new device waits for the link to go quiet on open.
 		if (rsp_opcode != RPC_OP_NOTIFICATION && (rsp_opcode != opcode || rsp_seqnum != seqnum)) {
+			// While waiting for a notification the device isn't using the
+			// watch, so another app's replies get in nobody's way. Only its
+			// hello, which ends our session and its subscriptions with it,
+			// ends the wait, and without waiting for the other app.
+			if (device->polling && rsp_opcode != RPC_OP_HELLO_REPLY) {
+				WARNING (device->base.context, "Skipping another app's reply (%02x %u).", rsp_opcode, rsp_seqnum);
+				status = suunto_nautic_skip (device, opcode, begin);
+				if (status != DC_STATUS_SUCCESS)
+					return status;
+				continue;
+			}
+
 			WARNING (device->base.context, "Another app is using the watch (%02x %u).", rsp_opcode, rsp_seqnum);
 			// The watch has one /Data stream, shared by every client: a reply
 			// on its resource (whatever the slot) means the other app's
@@ -445,7 +457,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 			else if (!device->taken_over)
 				device->taken_over = TAKEN_ACTIVE;
 			// A stream of ours is stopped first (suunto_nautic_stream).
-			if (!device->stream)
+			if (!device->stream && !device->polling)
 				suunto_nautic_step_aside (device);
 			return DC_STATUS_IO;
 		}

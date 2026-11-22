@@ -68,9 +68,10 @@ suunto_nautic_device_handshake_acknowledged (dc_device_t *device);
  * 1 once the device has stepped aside for another app using the watch (a
  * reply to its request, its hello, or a stream it ended), 0 otherwise. The
  * call that saw it fails with DC_STATUS_IO, the status a lost link also gives,
- * after waiting (about 20 s at most) for the other app to finish. From then on
- * the device sends nothing more: every call fails with DC_STATUS_IO, so the
- * host closes it and opens a new one, once the other app is done, to carry on.
+ * after waiting (about 20 s at most) for the other app to finish; a wait for a
+ * notification fails without that wait. From then on the device sends nothing
+ * more: every call fails with DC_STATUS_IO, so the host closes it and opens a
+ * new one, once the other app is done, to carry on.
  * What was downloaded before is kept for a resume, see
  * suunto_nautic_device_set_resume().
  */
@@ -196,7 +197,10 @@ suunto_nautic_device_get_nondives (dc_device_t *device, unsigned int *count);
  * Whiteboard-encoded as [type:u16 LE][value...]. wait_notification returns the
  * next pushed value on any subscribed handle, or DC_STATUS_TIMEOUT after
  * `timeout` milliseconds without a byte received, which isn't logged as an
- * error. Not valid while a dive download is in progress.
+ * error. Another app's replies on the link are skipped meanwhile; its hello,
+ * which ends the session and its subscriptions, fails the wait at once with
+ * DC_STATUS_IO, and suunto_nautic_device_taken_over() then returns 1. Not
+ * valid while a dive download is in progress.
  * unsubscribe also releases the handle when it is a per-id slot.
  */
 dc_status_t
