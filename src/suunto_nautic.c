@@ -228,7 +228,7 @@ typedef struct suunto_nautic_device_t {
 } suunto_nautic_device_t;
 
 static dc_status_t suunto_nautic_device_set_fingerprint (dc_device_t *abstract, const unsigned char data[], unsigned int size);
-static void suunto_nautic_step_aside (suunto_nautic_device_t *device);
+static dc_status_t suunto_nautic_step_aside (suunto_nautic_device_t *device);
 static dc_status_t suunto_nautic_device_foreach (dc_device_t *abstract, dc_dive_callback_t callback, void *userdata);
 static dc_status_t suunto_nautic_device_close (dc_device_t *abstract);
 
@@ -458,7 +458,7 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 				device->taken_over = TAKEN_ACTIVE;
 			// A stream of ours is stopped first (suunto_nautic_stream).
 			if (!device->stream && !device->polling)
-				suunto_nautic_step_aside (device);
+				return suunto_nautic_step_aside (device);
 			return DC_STATUS_IO;
 		}
 
@@ -1097,12 +1097,11 @@ error_release:
 error_exit:
 	device->stream = 0;
 	// Fork only: with the stream of ours stopped, step aside. A step-aside
-	// fails the download with DC_STATUS_IO, whatever ended the stream: after
-	// a hello that cut off a chunk, the read times out first.
-	if (device->taken_over) {
-		suunto_nautic_step_aside (device);
-		status = DC_STATUS_IO;
-	}
+	// fails the download with DC_STATUS_IO (or DC_STATUS_CANCELLED), whatever
+	// ended the stream: after a hello that cut off a chunk, the read times
+	// out first.
+	if (device->taken_over)
+		status = suunto_nautic_step_aside (device);
 	return status;
 }
 
@@ -1760,16 +1759,20 @@ suunto_nautic_wait_quiet (suunto_nautic_device_t *device)
 // with it, before failing: a host that reconnects at once would otherwise
 // meet the other app between its hello and its first requests, find the link
 // quiet and get in its way again. The wait is bounded and cancellable.
-static void
+// Returns the status the call that stepped aside fails with: DC_STATUS_IO, or
+// DC_STATUS_CANCELLED when the host cancelled the wait.
+static dc_status_t
 suunto_nautic_step_aside (suunto_nautic_device_t *device)
 {
 	if (device->stepped_aside)
-		return;
+		return DC_STATUS_IO;
 	device->stepped_aside = 1;
 
 	WARNING (device->base.context, "Waiting for the other app to finish.");
-	suunto_nautic_wait_quiet (device);
+	dc_status_t status = suunto_nautic_wait_quiet (device);
 	dc_iostream_set_timeout (device->iostream, TIMEOUT_DEFAULT);
+
+	return status == DC_STATUS_CANCELLED ? status : DC_STATUS_IO;
 }
 
 // Fork only: drop the packets left in the receive buffer since the last

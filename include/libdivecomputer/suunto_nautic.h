@@ -68,7 +68,8 @@ suunto_nautic_device_handshake_acknowledged (dc_device_t *device);
  * 1 once the device has stepped aside for another app using the watch (a
  * reply to its request, its hello, or a stream it ended), 0 otherwise. The
  * call that saw it fails with DC_STATUS_IO, the status a lost link also gives,
- * after waiting (about 20 s at most) for the other app to finish; a wait for a
+ * after waiting (about 20 s at most) for the other app to finish, or with
+ * DC_STATUS_CANCELLED when the host cancels that wait; a wait for a
  * notification fails without that wait. From then on the device sends nothing
  * more: every call fails with DC_STATUS_IO, so the host closes it and opens a
  * new one, once the other app is done, to carry on.
