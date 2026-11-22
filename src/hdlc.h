@@ -59,6 +59,19 @@ dc_hdlc_open (dc_iostream_t **iostream, dc_context_t *context, dc_iostream_t *ba
 dc_status_t
 dc_hdlc_set_shared_flag (dc_iostream_t *iostream, unsigned int value);
 
+/**
+ * Whether the last read failed with #DC_STATUS_IO on a damaged frame (an
+ * escaped flag or escape character, or a frame too large for the buffer)
+ * rather than on the underlying stream. The stream is still good, and the
+ * next read starts at the next frame.
+ *
+ * @param[in]   iostream    A valid HDLC I/O stream.
+ * @returns Non-zero for a damaged frame, zero otherwise (also for a stream
+ * that isn't an HDLC one).
+ */
+unsigned int
+dc_hdlc_damaged (dc_iostream_t *iostream);
+
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

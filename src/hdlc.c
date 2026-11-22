@@ -61,6 +61,7 @@ typedef struct dc_hdlc_t {
 	size_t wbuf_offset;
 	unsigned int shared;
 	unsigned int opened;
+	unsigned int damaged;
 } dc_hdlc_t;
 
 static const dc_iostream_vtable_t dc_hdlc_vtable = {
@@ -129,6 +130,7 @@ dc_hdlc_open (dc_iostream_t **out, dc_context_t *context, dc_iostream_t *base, s
 	hdlc->wbuf_offset = 0;
 	hdlc->shared = 0;
 	hdlc->opened = 0;
+	hdlc->damaged = 0;
 
 	*out = (dc_iostream_t *) hdlc;
 
@@ -154,6 +156,17 @@ dc_hdlc_set_shared_flag (dc_iostream_t *abstract, unsigned int value)
 	hdlc->opened = 0;
 
 	return DC_STATUS_SUCCESS;
+}
+
+unsigned int
+dc_hdlc_damaged (dc_iostream_t *abstract)
+{
+	dc_hdlc_t *hdlc = (dc_hdlc_t *) abstract;
+
+	if (!dc_iostream_isinstance (abstract, &dc_hdlc_vtable))
+		return 0;
+
+	return hdlc->damaged;
 }
 
 static dc_status_t
@@ -228,6 +241,7 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 	unsigned int escaped = 0;
 
 	hdlc->opened = 0;
+	hdlc->damaged = 0;
 
 	while (1) {
 		if (hdlc->rbuf_available == 0) {
@@ -237,8 +251,9 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 			if (status != DC_STATUS_SUCCESS) {
 				// Without any data after the flag, the next read carries on
 				// from it. A frame cut off by the failure is lost, and the
-				// next read skips its rest, up to a flag.
-				hdlc->opened = hdlc->shared && initialized && nbytes == 0;
+				// next read skips its rest, up to a flag; so is one cut off
+				// after an escape character, which the next read can't undo.
+				hdlc->opened = hdlc->shared && initialized && nbytes == 0 && !escaped;
 				goto out;
 			}
 
@@ -256,6 +271,7 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 					ERROR (hdlc->context, "HDLC frame escaped the special character %02x.", c);
 					// The flag still ends the frame, and opens the next.
 					hdlc->opened = hdlc->shared;
+					hdlc->damaged = 1;
 					status = DC_STATUS_IO;
 					goto out;
 				}
@@ -279,6 +295,7 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 			if (c == ESC) {
 				if (escaped) {
 					ERROR (hdlc->context, "HDLC frame escaped the special character %02x.", c);
+					hdlc->damaged = 1;
 					status = DC_STATUS_IO;
 					goto out;
 				}
@@ -300,6 +317,8 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 out:
 	if (nbytes > size) {
 		ERROR (hdlc->context, "HDLC frame is too large (" DC_PRINTF_SIZE " " DC_PRINTF_SIZE ").", nbytes, size);
+		if (status == DC_STATUS_SUCCESS)
+			hdlc->damaged = 1;
 		dc_status_set_error (&status, DC_STATUS_IO);
 		nbytes = size;
 	}

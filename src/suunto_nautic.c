@@ -405,6 +405,14 @@ suunto_nautic_recv (suunto_nautic_device_t *device, unsigned char opcode, unsign
 
 	while (1) {
 		status = dc_iostream_read (device->iostream, packet, sizeof(packet), &length);
+		// Fork only: a frame torn so that its framing breaks, as by another
+		// app's hello, is a damaged packet like one with a bad checksum.
+		if (status == DC_STATUS_IO && device->stream && dc_hdlc_damaged (device->iostream)) {
+			status = suunto_nautic_skip_damaged (device, opcode, begin, length);
+			if (status != DC_STATUS_SUCCESS)
+				return status;
+			continue;
+		}
 		if (status != DC_STATUS_SUCCESS) {
 			if (!(device->polling && status == DC_STATUS_TIMEOUT && length == 0))
 				ERROR (device->base.context, "Failed to receive the packet.");
@@ -1712,6 +1720,11 @@ suunto_nautic_probe (suunto_nautic_device_t *device, int *shared, int *busy)
 	status = dc_iostream_read (device->iostream, packet, sizeof (packet), &length);
 	if (status == DC_STATUS_TIMEOUT)
 		return DC_STATUS_SUCCESS;
+	// A damaged frame is another app's traffic too.
+	if (status == DC_STATUS_IO && dc_hdlc_damaged (device->iostream)) {
+		*busy = 1;
+		return DC_STATUS_SUCCESS;
+	}
 	if (status != DC_STATUS_SUCCESS)
 		return status;
 
@@ -1764,6 +1777,12 @@ suunto_nautic_wait_quiet (suunto_nautic_device_t *device)
 			quiet += QUIET_POLL_MS;
 			continue;
 		}
+		// A damaged frame is traffic like any other.
+		if (status == DC_STATUS_IO && dc_hdlc_damaged (device->iostream)) {
+			packets++;
+			quiet = 0;
+			continue;
+		}
 		if (status != DC_STATUS_SUCCESS)
 			return status;
 
@@ -1809,11 +1828,19 @@ suunto_nautic_drain (suunto_nautic_device_t *device)
 
 	unsigned int packets = 0;
 	while (packets < DRAIN_MAX) {
+		if (device_is_cancelled ((dc_device_t *) device))
+			return DC_STATUS_CANCELLED;
+
 		unsigned char packet[6 + MAX_PAYLOAD + 4] = {0};
 		size_t length = 0;
 		status = dc_iostream_read (device->iostream, packet, sizeof (packet), &length);
 		if (status == DC_STATUS_TIMEOUT)
 			break;
+		// A damaged frame is left from before like any other.
+		if (status == DC_STATUS_IO && dc_hdlc_damaged (device->iostream)) {
+			packets++;
+			continue;
+		}
 		if (status != DC_STATUS_SUCCESS)
 			return status;
 		if (length)
