@@ -1875,6 +1875,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 {
 	dc_status_t status = DC_STATUS_SUCCESS;
 	suunto_nautic_device_t *device = NULL;
+	// Fork only: the open found another app using the watch.
+	int other_app = 0;
 
 	if (out == NULL)
 		return DC_STATUS_INVALIDARGS;
@@ -1941,6 +1943,8 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	if (status == DC_STATUS_SUCCESS && busy) {
 		INFO (context, "Another app is using the watch; waiting until it is done.");
 		status = suunto_nautic_wait_quiet (device);
+		if (status == DC_STATUS_TIMEOUT)
+			other_app = 1;
 		if (status == DC_STATUS_SUCCESS)
 			status = dc_iostream_set_timeout (device->iostream, TIMEOUT_PROBE);
 		if (status == DC_STATUS_SUCCESS)
@@ -1949,6 +1953,7 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	if (status == DC_STATUS_SUCCESS && busy) {
 		ERROR (context, "Another app is still using the watch.");
 		status = DC_STATUS_TIMEOUT;
+		other_app = 1;
 	}
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to check for another app's session.");
@@ -1991,8 +1996,10 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		ERROR (context, "Failed to receive the hello.");
 		// Fork only: another app's traffic in reply to the hello: as busy as
 		// above, without waiting again.
-		if (device->taken_over)
+		if (device->taken_over) {
 			status = DC_STATUS_TIMEOUT;
+			other_app = 1;
+		}
 		goto error_close;
 	} else if (hello_len != sizeof (hello) || hello[0] != 0x09 || hello[1] != 0x09) {
 		// The reply has the layout of the hello, and the same protocol versions.
@@ -2011,6 +2018,11 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 	return DC_STATUS_SUCCESS;
 
 error_close:
+	// Fork only: DC_STATUS_TIMEOUT means another app is using the watch. Any
+	// other timeout, such as a write the transport wasn't ready to take, is a
+	// failed attempt like a broken link, which the host can retry at once.
+	if (status == DC_STATUS_TIMEOUT && !other_app)
+		status = DC_STATUS_IO;
 	dc_iostream_close (device->iostream);
 error_timer_free:
 	dc_timer_free (device->timer);
