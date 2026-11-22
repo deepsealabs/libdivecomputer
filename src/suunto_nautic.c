@@ -1765,12 +1765,18 @@ suunto_nautic_probe (suunto_nautic_device_t *device, int *shared, int *busy)
 	if (status != DC_STATUS_SUCCESS)
 		return status;
 
-	if (length >= 10 && packet[0] == RPC_START && packet[1] == RPC_OP_GET_REPLY &&
+	// The reply is HANDLE(3) 01 80 00 ERRCODE(2); a session answers with ERR_OK.
+	if (length == 6 + 8 + 4 && packet[0] == RPC_START && packet[1] == RPC_OP_GET_REPLY &&
 		array_uint16_le (packet + 4) == seqnum &&
-		array_uint32_le (packet + length - 4) == checksum_crc32r (packet, length - 4))
-		*shared = 1;
-	else
+		array_uint32_le (packet + length - 4) == checksum_crc32r (packet, length - 4)) {
+		unsigned int errcode = array_uint16_le (packet + 6 + 6);
+		if (errcode == ERR_OK)
+			*shared = 1;
+		else
+			WARNING (device->base.context, "The watch answered the probe with error code %u; taking it for no session.", errcode);
+	} else {
 		*busy = 1;
+	}
 
 	return status;
 }
