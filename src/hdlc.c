@@ -59,6 +59,8 @@ typedef struct dc_hdlc_t {
 	size_t rbuf_available;
 	size_t wbuf_size;
 	size_t wbuf_offset;
+	unsigned int shared;
+	unsigned int opened;
 } dc_hdlc_t;
 
 static const dc_iostream_vtable_t dc_hdlc_vtable = {
@@ -125,6 +127,8 @@ dc_hdlc_open (dc_iostream_t **out, dc_context_t *context, dc_iostream_t *base, s
 	hdlc->rbuf_available = 0;
 	hdlc->wbuf_size = osize;
 	hdlc->wbuf_offset = 0;
+	hdlc->shared = 0;
+	hdlc->opened = 0;
 
 	*out = (dc_iostream_t *) hdlc;
 
@@ -136,6 +140,20 @@ error_free:
 	dc_iostream_deallocate ((dc_iostream_t *) hdlc);
 error_exit:
 	return status;
+}
+
+dc_status_t
+dc_hdlc_set_shared_flag (dc_iostream_t *abstract, unsigned int value)
+{
+	dc_hdlc_t *hdlc = (dc_hdlc_t *) abstract;
+
+	if (!dc_iostream_isinstance (abstract, &dc_hdlc_vtable))
+		return DC_STATUS_INVALIDARGS;
+
+	hdlc->shared = value != 0;
+	hdlc->opened = 0;
+
+	return DC_STATUS_SUCCESS;
 }
 
 static dc_status_t
@@ -205,8 +223,11 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 	dc_hdlc_t *hdlc = (dc_hdlc_t *) abstract;
 	size_t nbytes = 0;
 
-	unsigned int initialized = 0;
+	// With shared flags, the flag that closed the last frame opens this one.
+	unsigned int initialized = hdlc->opened;
 	unsigned int escaped = 0;
+
+	hdlc->opened = 0;
 
 	while (1) {
 		if (hdlc->rbuf_available == 0) {
@@ -214,6 +235,10 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 			size_t len = 0;
 			status = dc_iostream_read (hdlc->iostream, hdlc->rbuf, hdlc->rbuf_size, &len);
 			if (status != DC_STATUS_SUCCESS) {
+				// Without any data after the flag, the next read carries on
+				// from it. A frame cut off by the failure is lost, and the
+				// next read skips its rest, up to a flag.
+				hdlc->opened = hdlc->shared && initialized && nbytes == 0;
 				goto out;
 			}
 
@@ -229,6 +254,8 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 			if (c == END) {
 				if (escaped) {
 					ERROR (hdlc->context, "HDLC frame escaped the special character %02x.", c);
+					// The flag still ends the frame, and opens the next.
+					hdlc->opened = hdlc->shared;
 					status = DC_STATUS_IO;
 					goto out;
 				}
@@ -237,6 +264,7 @@ dc_hdlc_read (dc_iostream_t *abstract, void *data, size_t size, size_t *actual)
 				// closing flag of one frame and the opening flag of the next,
 				// e.g. when the read started inside a frame.
 				if (initialized && nbytes) {
+					hdlc->opened = hdlc->shared;
 					goto out;
 				}
 
@@ -384,6 +412,7 @@ dc_hdlc_purge (dc_iostream_t *abstract, dc_direction_t direction)
 	if (direction & DC_DIRECTION_INPUT) {
 		hdlc->rbuf_available = 0;
 		hdlc->rbuf_offset = 0;
+		hdlc->opened = 0;
 	}
 
 	return dc_iostream_purge (hdlc->iostream, direction);

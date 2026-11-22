@@ -1891,6 +1891,15 @@ suunto_nautic_device_open (dc_device_t **out, dc_context_t *context, dc_iostream
 		goto error_timer_free;
 	}
 
+	// Fork only: another app's hello cuts off the chunk it arrives in, before
+	// the chunk's closing flag, and the hello's opening flag ends the chunk.
+	// Read the hello all the same. The watch sends nothing between frames.
+	status = dc_hdlc_set_shared_flag (device->iostream, 1);
+	if (status != DC_STATUS_SUCCESS) {
+		ERROR (context, "Failed to share the HDLC flags.");
+		goto error_close;
+	}
+
 	status = dc_iostream_set_timeout (device->iostream, TIMEOUT_PROBE);
 	if (status != DC_STATUS_SUCCESS) {
 		ERROR (context, "Failed to set the timeout.");
